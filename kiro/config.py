@@ -556,7 +556,7 @@ ACCOUNT_SELECTION_MODES = ("sticky", "round_robin")
 
 def _parse_account_selection(value: str) -> str:
     """
-    Normalize ACCOUNT_SELECTION, falling back to "sticky" for unknown values.
+    Normalize ACCOUNT_SELECTION, falling back to "round_robin" for unknown values.
     
     Args:
         value: Raw environment value
@@ -566,15 +566,16 @@ def _parse_account_selection(value: str) -> str:
     """
     mode = value.strip().lower()
     if mode not in ACCOUNT_SELECTION_MODES:
-        logger.warning(f"Unknown ACCOUNT_SELECTION='{value}', falling back to 'sticky' (allowed: sticky, round_robin)")
-        return "sticky"
+        logger.warning(f"Unknown ACCOUNT_SELECTION='{value}', falling back to 'round_robin' (allowed: sticky, round_robin)")
+        return "round_robin"
     return mode
 
 
 # Account selection strategy (multi-account only)
-# sticky: stay on the last successful account until it fails (default)
-# round_robin: each request starts from the next account in turn
-ACCOUNT_SELECTION: str = _parse_account_selection(os.getenv("ACCOUNT_SELECTION", "sticky"))
+# round_robin: each request starts from the next account in turn (default)
+# sticky: stay on the last successful account until it fails
+# With a single account both modes behave the same
+ACCOUNT_SELECTION: str = _parse_account_selection(os.getenv("ACCOUNT_SELECTION", "round_robin"))
 
 # Fixed cooldown in seconds for an account that returned 429 (round_robin only)
 # Replaces the exponential Circuit Breaker for rate limits

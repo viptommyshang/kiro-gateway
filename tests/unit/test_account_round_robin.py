@@ -4,13 +4,15 @@
 Tests for ACCOUNT_SELECTION=round_robin and the 429 rate-limit cooldown.
 
 Covers:
-- AccountManager: round_robin rotation, sticky default, 429 cooldown
+- AccountManager: round_robin rotation (default), sticky, 429 cooldown
 - Routes (OpenAI + Anthropic): 429 failover within one request,
   no same-account 429 retries with 2+ accounts, 429 + Retry-After when
   every account is rate-limited, single-account behaviour unchanged
-- Config: ACCOUNT_SELECTION parsing
+  (429 retried in place with backoff, no cooldown)
+- Config: ACCOUNT_SELECTION parsing and round_robin default
 """
 
+import importlib
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -66,8 +68,28 @@ class TestParseAccountSelection:
         assert _parse_account_selection("sticky") == "sticky"
         assert _parse_account_selection(" ROUND_ROBIN ") == "round_robin"
 
-    def test_unknown_value_falls_back_to_sticky(self):
-        assert _parse_account_selection("random") == "sticky"
+    def test_unknown_value_falls_back_to_round_robin(self):
+        assert _parse_account_selection("random") == "round_robin"
+
+    def test_default_is_round_robin(self, monkeypatch, tmp_path):
+        """
+        What it does: Reloads kiro.config without ACCOUNT_SELECTION set.
+        Purpose: round_robin is the default selection mode.
+        """
+        import kiro.config as config
+
+        monkeypatch.delenv("ACCOUNT_SELECTION", raising=False)
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
+        try:
+            importlib.reload(config)
+            assert config.ACCOUNT_SELECTION == "round_robin"
+        finally:
+            monkeypatch.undo()
+            importlib.reload(config)
+
+    def test_account_manager_uses_configured_default(self, tmp_path):
+        manager = AccountManager(str(tmp_path / "c.json"), str(tmp_path / "s.json"))
+        assert manager._selection == "round_robin"
 
 
 class TestRoundRobinSelection:
@@ -101,11 +123,12 @@ class TestRoundRobinSelection:
         assert [first.id, second.id, third.id] == [ids[0], ids[1], ids[1]]
 
     @pytest.mark.asyncio
-    async def test_sticky_default_unchanged(self, tmp_path):
+    async def test_sticky_selection_unchanged(self, monkeypatch, tmp_path):
         """
-        What it does: Default selection keeps returning the last successful account.
-        Purpose: sticky (default) behaviour must not change.
+        What it does: ACCOUNT_SELECTION=sticky keeps returning the last successful account.
+        Purpose: sticky behaviour must not change now that it is opt-in.
         """
+        monkeypatch.setattr("kiro.account_manager.ACCOUNT_SELECTION", "sticky")
         manager = AccountManager(str(tmp_path / "c.json"), str(tmp_path / "s.json"))
         assert manager._selection == "sticky"
 
@@ -177,7 +200,47 @@ class TestRoundRobinSelection:
         assert account.failures == 1
         assert account.cooldown_until == 0.0
         assert manager.retry_rate_limit_in_place() is True
+        assert manager.rate_limit_retry_after() is None
         assert (await manager.get_next_account(MODEL)).id == account_id
+
+    @pytest.mark.asyncio
+    async def test_round_robin_single_account_gets_every_request(self, tmp_path):
+        """
+        What it does: Consecutive requests (successes and failures) on 1 account.
+        Purpose: The only account is always selected; cursor and breaker are ignored.
+        """
+        manager = _make_manager(tmp_path, 1, "round_robin")
+        account_id = list(manager._accounts.keys())[0]
+        manager._rr_cursor = 7
+
+        for status in (429, 402, 403, 429):
+            await manager.report_failure(account_id, MODEL, ErrorType.RECOVERABLE, status, None)
+            assert (await manager.get_next_account(MODEL)).id == account_id
+
+        await manager.report_success(account_id, MODEL)
+        for _ in range(3):
+            assert (await manager.get_next_account(MODEL)).id == account_id
+
+        account = manager._accounts[account_id]
+        assert account.failures == 0
+        assert account.cooldown_until == 0.0
+        assert account.stats.successful_requests == 1
+        assert account.stats.failed_requests == 4
+
+    @pytest.mark.asyncio
+    async def test_round_robin_cursor_wraps_after_accounts_removed(self, tmp_path):
+        """
+        What it does: Cursor past the end after accounts disappear.
+        Purpose: Selection uses cursor modulo the current account count.
+        """
+        manager = _make_manager(tmp_path, 2, "round_robin")
+        ids = list(manager._accounts.keys())
+        manager._rr_cursor = 5
+        manager._current_account_index = 5
+
+        picked = [(await manager.get_next_account(MODEL)).id for _ in range(3)]
+
+        assert picked == [ids[1], ids[0], ids[1]]
 
 
 @pytest.fixture
@@ -315,3 +378,81 @@ class TestRoundRobinRoutes:
         assert "Retry-After" not in response.headers
         assert calls[0][1] is True
         assert len(calls) == 1
+
+
+def _upstream_response(status_code: int, body: bytes = b""):
+    """httpx-like streamed response for KiroHttpClient."""
+    response = MagicMock()
+    response.status_code = status_code
+    response.aread = AsyncMock(return_value=body)
+    response.aclose = AsyncMock()
+    return response
+
+
+class TestSingleAccountRoundRobinEndToEnd:
+    """Real KiroHttpClient + routes with one account in round_robin (the default)."""
+
+    def _install(self, account_app, tmp_path, upstream):
+        client, install = account_app
+        manager = _make_manager(tmp_path, 1, "round_robin")
+        account = list(manager._accounts.values())[0]
+        account.auth_manager.get_access_token = AsyncMock(return_value="token")
+        account.auth_manager.fingerprint = "fp"
+        install(manager)
+        shared = MagicMock()
+        shared.build_request = MagicMock(return_value="request")
+        shared.send = AsyncMock(side_effect=upstream)
+        return client, manager, account, shared
+
+    def test_429_retried_on_same_account_then_returned(self, account_app, tmp_path, valid_proxy_api_key):
+        """
+        What it does: Upstream answers 429 three times, then 200 on the next request.
+        Purpose: 429 is retried in place with backoff, the client gets the real 429,
+        and no cooldown blocks the next request.
+        """
+        rate_limited = json.dumps({"message": "Too many requests", "reason": "USER_REQUEST_RATE_EXCEEDED"}).encode()
+        upstream = [_upstream_response(429, rate_limited) for _ in range(3)] + [_upstream_response(200)]
+        client, manager, account, shared = self._install(account_app, tmp_path, upstream)
+        sleep = AsyncMock()
+
+        with patch.object(client.app.state, "http_client", shared), \
+                patch("kiro.http_client.asyncio.sleep", sleep), \
+                patch("kiro.routes_openai.collect_stream_response", AsyncMock(return_value={"id": "ok"})):
+            response = _openai_post(client, valid_proxy_api_key)
+
+            assert response.status_code == 429
+            assert "Retry-After" not in response.headers
+            assert "All available accounts" not in response.text
+            assert shared.send.await_count == 3
+            assert [c.args[0] for c in sleep.await_args_list] == [1.0, 2.0, 4.0]
+            assert account.cooldown_until == 0.0
+
+            again = _openai_post(client, valid_proxy_api_key)
+
+        assert again.status_code == 200
+        assert again.json() == {"id": "ok"}
+        assert shared.send.await_count == 4
+        assert account.failures == 0
+        assert account.stats.successful_requests == 1
+
+    def test_402_returned_with_real_status(self, account_app, tmp_path, valid_proxy_api_key):
+        quota = json.dumps({"message": "Monthly limit reached", "reason": "MONTHLY_REQUEST_COUNT"}).encode()
+        client, manager, account, shared = self._install(account_app, tmp_path, [_upstream_response(402, quota)])
+
+        with patch.object(client.app.state, "http_client", shared):
+            response = _anthropic_post(client, valid_proxy_api_key)
+
+        assert response.status_code == 402
+        assert shared.send.await_count == 1
+
+    def test_consecutive_successes_stay_on_the_account(self, account_app, tmp_path, valid_proxy_api_key):
+        client, manager, account, shared = self._install(
+            account_app, tmp_path, [_upstream_response(200) for _ in range(3)]
+        )
+
+        with patch.object(client.app.state, "http_client", shared), \
+                patch("kiro.routes_openai.collect_stream_response", AsyncMock(return_value={"id": "ok"})):
+            statuses = [_openai_post(client, valid_proxy_api_key).status_code for _ in range(3)]
+
+        assert statuses == [200, 200, 200]
+        assert account.stats.successful_requests == 3

@@ -36,6 +36,11 @@ class TestAccountSystemFullFlow:
     Purpose: Verify Account System works correctly in realistic scenarios
     """
     
+    @pytest.fixture(autouse=True)
+    def sticky_selection(self, monkeypatch):
+        """These flows cover sticky + Circuit Breaker semantics (round_robin is the default)."""
+        monkeypatch.setattr("kiro.account_manager.ACCOUNT_SELECTION", "sticky")
+    
     @pytest.mark.asyncio
     async def test_full_failover_flow_two_accounts(
         self,
