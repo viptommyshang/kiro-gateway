@@ -167,6 +167,21 @@ class KiroHttpClient:
                 # Propagating here could mask the original exception
                 logger.warning(f"Error closing HTTP client: {e}")
     
+    @staticmethod
+    async def _read_and_release(response: httpx.Response) -> None:
+        """
+        Reads a response body so its pool connection is released.
+        
+        The body stays cached on the response, so the caller can still
+        aread() it if this response is returned after retries are exhausted.
+        On read failure the response is closed and the error is re-raised.
+        """
+        try:
+            await response.aread()
+        except BaseException:
+            await response.aclose()
+            raise
+    
     async def request_with_retry(
         self,
         method: str,
@@ -198,7 +213,8 @@ class KiroHttpClient:
             httpx.Response with successful response
         
         Raises:
-            HTTPException: On failure after all attempts (502/504)
+            HTTPException: On failure after all attempts (502/504),
+                or 503 immediately when the connection pool is exhausted
         """
         # Determine the number of retry attempts
         # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
@@ -241,11 +257,14 @@ class KiroHttpClient:
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
+                    # Release the pool connection before retrying
+                    await response.aclose()
                     await self.auth_manager.force_refresh()
                     continue
                 
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
+                    await self._read_and_release(response)
                     last_response = response  # Сохраняем для возврата после exhaustion
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
@@ -254,6 +273,7 @@ class KiroHttpClient:
                 
                 # 5xx - server error, wait and retry
                 if 500 <= response.status_code < 600:
+                    await self._read_and_release(response)
                     last_response = response  # Сохраняем для возврата после exhaustion
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
@@ -264,6 +284,15 @@ class KiroHttpClient:
                 return response
                 
             except httpx.TimeoutException as e:
+                # Pool exhaustion is local overload: retrying only queues the request again
+                if isinstance(e, httpx.PoolTimeout):
+                    logger.error(f"Connection pool exhausted, not retrying (attempt {attempt + 1}/{max_retries})")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Gateway overloaded: no free upstream connection, retry later",
+                        headers={"Retry-After": "5"}
+                    )
+                
                 last_error = e
                 
                 # Classify timeout error for user-friendly messaging

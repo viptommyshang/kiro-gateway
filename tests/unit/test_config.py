@@ -969,3 +969,56 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+class TestRetryAndPoolConfig:
+    """Tests for retry and shared HTTP pool configuration."""
+    
+    _DEFAULTS = {
+        "MAX_RETRIES": 3,
+        "BASE_RETRY_DELAY": 1.0,
+        "HTTP_MAX_CONNECTIONS": 100,
+        "HTTP_MAX_KEEPALIVE_CONNECTIONS": 20,
+        "HTTP_POOL_TIMEOUT": 30.0,
+    }
+    
+    def test_defaults(self, monkeypatch):
+        """
+        What it does: Verifies retry/pool settings keep their previous hard-coded defaults.
+        Purpose: Ensure behavior is unchanged when env vars are not set.
+        """
+        print("Setup: Removing retry/pool vars from environment...")
+        for name in self._DEFAULTS:
+            monkeypatch.delenv(name, raising=False)
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        with patch("dotenv.load_dotenv"):
+            reload(config_module)
+        
+        for name, expected in self._DEFAULTS.items():
+            print(f"Comparing {name}: Expected {expected}, Got {getattr(config_module, name)}")
+            assert getattr(config_module, name) == expected
+    
+    def test_from_environment(self, monkeypatch):
+        """
+        What it does: Verifies retry/pool settings are read from environment.
+        Purpose: Ensure operators can tune pool size and retries without code changes.
+        """
+        print("Setup: Setting retry/pool vars...")
+        monkeypatch.setenv("MAX_RETRIES", "1")
+        monkeypatch.setenv("BASE_RETRY_DELAY", "0.5")
+        monkeypatch.setenv("HTTP_MAX_CONNECTIONS", "200")
+        monkeypatch.setenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "40")
+        monkeypatch.setenv("HTTP_POOL_TIMEOUT", "5")
+        
+        print("Action: Reloading config module...")
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+        
+        assert config_module.MAX_RETRIES == 1
+        assert config_module.BASE_RETRY_DELAY == 0.5
+        assert config_module.HTTP_MAX_CONNECTIONS == 200
+        assert config_module.HTTP_MAX_KEEPALIVE_CONNECTIONS == 40
+        assert config_module.HTTP_POOL_TIMEOUT == 5.0

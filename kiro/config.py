@@ -196,12 +196,25 @@ TOKEN_REFRESH_THRESHOLD: int = 600
 # Retry Configuration
 # ==================================================================================================
 
-# Maximum number of retry attempts on errors
-MAX_RETRIES: int = 3
+# Maximum number of retry attempts on errors (non-streaming requests)
+MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
 
 # Base delay between attempts (seconds)
 # Uses exponential backoff: delay * (2 ** attempt)
-BASE_RETRY_DELAY: float = 1.0
+BASE_RETRY_DELAY: float = float(os.getenv("BASE_RETRY_DELAY", "1.0"))
+
+# ==================================================================================================
+# Shared HTTP Client Pool Configuration
+# ==================================================================================================
+
+# Maximum total connections in the shared HTTP client pool
+HTTP_MAX_CONNECTIONS: int = int(os.getenv("HTTP_MAX_CONNECTIONS", "100"))
+
+# Maximum idle keep-alive connections in the shared HTTP client pool
+HTTP_MAX_KEEPALIVE_CONNECTIONS: int = int(os.getenv("HTTP_MAX_KEEPALIVE_CONNECTIONS", "20"))
+
+# Seconds to wait for a free pool connection before failing with 503
+HTTP_POOL_TIMEOUT: float = float(os.getenv("HTTP_POOL_TIMEOUT", "30"))
 
 # ==================================================================================================
 # Hidden Models Configuration

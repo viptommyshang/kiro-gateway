@@ -471,6 +471,176 @@ class TestKiroHttpClientRequestWithRetry:
         assert response.status_code == 200
 
 
+class _TrackingStream(httpx.AsyncByteStream):
+    """Async byte stream that records whether it was closed (i.e. pool slot released)."""
+    
+    def __init__(self, body: bytes):
+        self.body = body
+        self.closed = False
+    
+    async def __aiter__(self):
+        yield self.body
+    
+    async def aclose(self):
+        self.closed = True
+
+
+def _streamed_response(status_code: int, body: bytes = b"") -> httpx.Response:
+    """Creates an unread streamed httpx.Response, like client.send(..., stream=True) returns."""
+    return httpx.Response(
+        status_code,
+        stream=_TrackingStream(body),
+        request=httpx.Request("POST", "https://api.example.com/test")
+    )
+
+
+class TestKiroHttpClientConnectionRelease:
+    """Tests that retried responses release their pool connection."""
+    
+    async def _run_streaming(self, http_client, responses):
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.build_request = Mock(return_value=Mock())
+        mock_client.send = AsyncMock(side_effect=responses)
+        
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.FIRST_TOKEN_MAX_RETRIES', 3):
+                    with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock):
+                        response = await http_client.request_with_retry(
+                            "POST",
+                            "https://api.example.com/test",
+                            {"data": "value"},
+                            stream=True
+                        )
+        return response, mock_client
+    
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [403, 429, 500, 503])
+    async def test_intermediate_error_response_is_closed(self, mock_auth_manager_for_http, status_code):
+        """
+        What it does: Verifies an intermediate 403/429/5xx streamed response is closed before retry.
+        Purpose: Prevent leaking shared pool connections (PoolTimeout after ~100 leaks).
+        """
+        print(f"Setup: {status_code} followed by 200...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        error_response = _streamed_response(status_code, b'{"detail":"error"}')
+        ok_response = _streamed_response(200, b"ok")
+        
+        print("Action: Executing streaming request...")
+        response, _ = await self._run_streaming(http_client, [error_response, ok_response])
+        
+        print("Verification: intermediate response closed, success response left open...")
+        assert error_response.is_closed
+        assert error_response.stream.closed
+        assert response is ok_response
+        assert not ok_response.stream.closed
+    
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [429, 500])
+    async def test_exhausted_last_response_body_still_readable(self, mock_auth_manager_for_http, status_code):
+        """
+        What it does: Verifies all retried responses are closed and the final one's body stays readable.
+        Purpose: Caller must still classify the real upstream error after retries are exhausted.
+        """
+        print(f"Setup: three {status_code} responses...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        responses = [
+            _streamed_response(status_code, f'{{"attempt":{i}}}'.encode())
+            for i in range(3)
+        ]
+        
+        print("Action: Executing streaming request...")
+        response, mock_client = await self._run_streaming(http_client, responses)
+        
+        print("Verification: every response closed, last body readable...")
+        assert mock_client.send.call_count == 3
+        assert all(r.stream.closed for r in responses)
+        assert response is responses[-1]
+        assert response.status_code == status_code
+        assert await response.aread() == b'{"attempt":2}'
+    
+    @pytest.mark.asyncio
+    async def test_read_error_still_closes_response(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies a 429 whose body fails to read is still closed, then retried.
+        Purpose: Read errors must not leak the pool connection.
+        """
+        print("Setup: 429 with failing body, then 200...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        class _FailingStream(_TrackingStream):
+            async def __aiter__(self):
+                raise httpx.ReadError("connection reset")
+                yield b""
+        
+        failing = httpx.Response(
+            429,
+            stream=_FailingStream(b""),
+            request=httpx.Request("POST", "https://api.example.com/test")
+        )
+        ok_response = _streamed_response(200, b"ok")
+        
+        print("Action: Executing streaming request...")
+        response, mock_client = await self._run_streaming(http_client, [failing, ok_response])
+        
+        print("Verification: failing response closed, request retried...")
+        assert failing.stream.closed
+        assert response is ok_response
+        assert mock_client.send.call_count == 2
+    
+    @pytest.mark.asyncio
+    async def test_pool_timeout_returns_503_without_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies PoolTimeout raises 503 with Retry-After immediately.
+        Purpose: Pool exhaustion is local overload; retrying only queues the request again.
+        """
+        print("Setup: send raises PoolTimeout...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        
+        print("Action: Executing streaming request...")
+        with pytest.raises(HTTPException) as exc_info:
+            await self._run_streaming(
+                http_client,
+                [httpx.PoolTimeout("pool"), _streamed_response(200, b"ok")]
+            )
+        
+        print("Verification: 503, Retry-After header, single send call...")
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers == {"Retry-After": "5"}
+        assert "Gateway overloaded" in exc_info.value.detail
+    
+    @pytest.mark.asyncio
+    async def test_pool_timeout_sends_only_once(self, mock_auth_manager_for_http):
+        """
+        What it does: Verifies PoolTimeout does not trigger backoff or a second send.
+        Purpose: Fail fast instead of 3 x pool wait.
+        """
+        print("Setup: send raises PoolTimeout...")
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.build_request = Mock(return_value=Mock())
+        mock_client.send = AsyncMock(side_effect=httpx.PoolTimeout("pool"))
+        
+        print("Action: Executing streaming request...")
+        with patch.object(http_client, '_get_client', return_value=mock_client):
+            with patch('kiro.http_client.get_kiro_headers', return_value={}):
+                with patch('kiro.http_client.FIRST_TOKEN_MAX_RETRIES', 3):
+                    with patch('kiro.http_client.asyncio.sleep', new_callable=AsyncMock) as mock_sleep:
+                        with pytest.raises(HTTPException):
+                            await http_client.request_with_retry(
+                                "POST",
+                                "https://api.example.com/test",
+                                {"data": "value"},
+                                stream=True
+                            )
+        
+        print("Verification: one send call, no sleep...")
+        mock_client.send.assert_called_once()
+        mock_sleep.assert_not_called()
+
+
 class TestKiroHttpClientContextManager:
     """Tests for async context manager."""
     

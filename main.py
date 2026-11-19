@@ -70,6 +70,9 @@ from kiro.config import (
     DEFAULT_SERVER_HOST,
     DEFAULT_SERVER_PORT,
     STREAMING_READ_TIMEOUT,
+    HTTP_MAX_CONNECTIONS,
+    HTTP_MAX_KEEPALIVE_CONNECTIONS,
+    HTTP_POOL_TIMEOUT,
     HIDDEN_MODELS,
     MODEL_ALIASES,
     HIDDEN_FROM_LIST,
@@ -337,8 +340,8 @@ async def lifespan(app: FastAPI):
     # This reduces memory usage and enables connection reuse across requests
     # Limits: max 100 total connections, max 20 keep-alive connections
     limits = httpx.Limits(
-        max_connections=100,
-        max_keepalive_connections=20,
+        max_connections=HTTP_MAX_CONNECTIONS,
+        max_keepalive_connections=HTTP_MAX_KEEPALIVE_CONNECTIONS,
         keepalive_expiry=30.0  # Close idle connections after 30 seconds
     )
     # Timeout configuration for streaming (long read timeout for model "thinking")
@@ -346,7 +349,7 @@ async def lifespan(app: FastAPI):
         connect=30.0,
         read=STREAMING_READ_TIMEOUT,  # 300 seconds for streaming
         write=30.0,
-        pool=30.0
+        pool=HTTP_POOL_TIMEOUT
     )
     app.state.http_client = httpx.AsyncClient(
         limits=limits,
