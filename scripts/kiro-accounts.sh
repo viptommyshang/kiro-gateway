@@ -4,6 +4,7 @@
 # 网关扫描 accounts/ 目录，每个 sqlite 文件就是一个账号。
 # 本脚本把「加账号 / 停用账号 / 恢复账号 / 重启并重置状态 / 查看状态」收成一条命令。
 # 任何时候都不会打印 token 内容。
+# 使用说明: docs/zh/kiro-accounts.md
 #
 # 可用环境变量覆盖的路径（默认值对应生产部署）：
 #   BASE=/opt/docker/kiro-gateway          账号目录、state、退役文件所在
@@ -25,15 +26,17 @@ STARTUP_LOG_PATTERN='Scanning folder|Loaded [0-9]+ account|Initialized account|S
 
 DRY_RUN=0
 FORCE=0
+MOVE=0
 
 usage() {
 	cat <<EOF
-用法: $(basename "$0") [--dry-run] [--force] <命令> [参数]
+用法: $(basename "$0") [--dry-run] [--force] [--move] <命令> [参数]
 
 命令:
   list                         列出 accounts/ 中的账号、旁边的退役文件，以及 state.json 里的失败数/统计
   add <data.sqlite3> [名字]    校验并加入新账号为 accounts/acct-<名字>.sqlite3，然后重启
                                （不给名字时自动取下一个未用的字母，如 acct-d）
+                               加 --move 时移动源文件而不是复制（源文件随后不再存在）
   disable <名字> [原因]        把 accounts/acct-<名字>.sqlite3 移到 \$BASE/acct-<名字>.sqlite3.<原因>
                                （原因默认 disabled，例如 revoked、noquota），然后重启
   enable <名字>                把退役文件移回 accounts/，然后重启
@@ -43,9 +46,11 @@ usage() {
 选项:
   --dry-run                    只打印将要执行的操作，不做任何修改
   --force                      允许停用最后一个账号
+  --move                       只用于 add：移动而不是复制 data.sqlite3，避免留下第二份凭证
   -h, --help                   显示本帮助
 
 名字可写成 c、acct-c 或 acct-c.sqlite3。
+详细说明: docs/zh/kiro-accounts.md
 
 当前路径: BASE=$BASE  COMPOSE_DIR=$COMPOSE_DIR  CONTAINER=$CONTAINER
 EOF
@@ -350,8 +355,13 @@ cmd_add() {
 	refuse_duplicate "$src"
 	owner="$(owner_of "$ACCOUNTS_DIR")"
 
-	info "将加入账号: $src → ${dst}（属主 ${owner}，权限 600），然后重启"
-	run cp "$src" "$dst.tmp"
+	if [ "$MOVE" -eq 1 ]; then
+		info "将移动账号文件: $src → ${dst}（属主 ${owner}，权限 600，源文件不再保留），然后重启"
+		run mv "$src" "$dst.tmp"
+	else
+		info "将加入账号: $src → ${dst}（属主 ${owner}，权限 600），然后重启"
+		run cp "$src" "$dst.tmp"
+	fi
 	run chown "$owner" "$dst.tmp"
 	run chmod 600 "$dst.tmp"
 	run mv "$dst.tmp" "$dst"
@@ -418,6 +428,7 @@ main() {
 		case "$1" in
 			--dry-run) DRY_RUN=1 ;;
 			--force) FORCE=1 ;;
+			--move) MOVE=1 ;;
 			-h | --help)
 				usage
 				exit 0
@@ -432,6 +443,7 @@ main() {
 	}
 	local cmd="${args[0]}"
 	args=("${args[@]:1}")
+	[ "$MOVE" -eq 0 ] || [ "$cmd" = "add" ] || die "--move 只能用于 add"
 	[ "$DRY_RUN" -eq 0 ] || echo "*** dry-run：只打印操作，不做修改 ***"
 	case "$cmd" in
 		list) cmd_list ;;
