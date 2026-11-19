@@ -349,6 +349,24 @@ async def messages(
                         }
                     )
                 else:
+                    retry_after = account_manager.rate_limit_retry_after()
+                    if retry_after is not None:
+                        # Accounts are only rate-limited: 429 tells clients to back off
+                        detail = f"All available accounts are rate limited. Retry after {retry_after}s."
+                        if last_error_message:
+                            detail += f" Error from last account: {last_error_message}"
+                        logger.warning(f"HTTP 429 - POST /v1/messages - {detail[:100]}")
+                        return JSONResponse(
+                            status_code=429,
+                            headers={"Retry-After": str(retry_after)},
+                            content={
+                                "type": "error",
+                                "error": {
+                                    "type": "rate_limit_error",
+                                    "message": detail
+                                }
+                            }
+                        )
                     # Multiple accounts - generic error with context
                     detail = "No available accounts for this model."
                     if last_error_message:
@@ -430,7 +448,8 @@ async def messages(
                     "POST",
                     url,
                     kiro_payload,
-                    stream=True
+                    stream=True,
+                    retry_on_429=account_manager.retry_rate_limit_in_place()
                 )
                 
                 if response.status_code == 200:

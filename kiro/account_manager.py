@@ -35,6 +35,7 @@ Key features:
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -56,6 +57,8 @@ from kiro.config import (
     ACCOUNT_MAX_BACKOFF_MULTIPLIER,
     ACCOUNT_PROBABILISTIC_RETRY_CHANCE,
     ACCOUNT_CACHE_TTL,
+    ACCOUNT_SELECTION,
+    ACCOUNT_RATE_LIMIT_COOLDOWN,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
 )
@@ -151,6 +154,7 @@ class Account:
         failures: Consecutive failure count (for Circuit Breaker)
         last_failure_time: Timestamp of last failure
         models_cached_at: Timestamp of last model cache update
+        cooldown_until: Rate-limit (429) cooldown end timestamp (round_robin, not persisted)
         stats: Usage statistics
     """
     id: str
@@ -160,6 +164,7 @@ class Account:
     failures: int = 0
     last_failure_time: float = 0.0
     models_cached_at: float = 0.0
+    cooldown_until: float = 0.0
     stats: AccountStats = field(default_factory=AccountStats)
 
 
@@ -211,6 +216,8 @@ class AccountManager:
         self._dirty = False
         self._credentials_config: List[Dict] = []
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
+        self._selection: str = ACCOUNT_SELECTION
+        self._rr_cursor: int = 0  # Next start index for round_robin
     
     async def load_credentials(self) -> None:
         """
@@ -271,7 +278,7 @@ class AccountManager:
             expanded_path = Path(path).expanduser()
             if expanded_path.is_dir():
                 logger.info(f"Scanning folder for credentials: {path}")
-                for file_path in expanded_path.iterdir():
+                for file_path in sorted(expanded_path.iterdir()):
                     if not file_path.is_file():
                         continue
                     
@@ -700,11 +707,17 @@ class AccountManager:
             # Multi-account logic: GLOBAL sticky
             normalized_model = normalize_model_name(model)
             
-            # ALWAYS start from GLOBAL index (one current account for ALL models)
-            start_index = self._current_account_index
-            
             # ALWAYS iterate over ALL accounts
             all_account_ids = list(self._accounts.keys())
+            
+            if self._selection == "round_robin":
+                # Each new request starts from the next account; failover calls reuse the cursor
+                start_index = self._rr_cursor % len(all_account_ids)
+                if not exclude_accounts:
+                    self._rr_cursor = (start_index + 1) % len(all_account_ids)
+            else:
+                # Start from GLOBAL index (one current account for ALL models)
+                start_index = self._current_account_index
             
             for i in range(len(all_account_ids)):
                 current_index = (start_index + i) % len(all_account_ids)
@@ -713,6 +726,10 @@ class AccountManager:
                 
                 # Skip accounts already tried in current failover loop
                 if exclude_accounts and account_id in exclude_accounts:
+                    continue
+                
+                # Skip accounts in rate-limit (429) cooldown
+                if account.cooldown_until > time.time():
                     continue
                 
                 # Check Circuit Breaker (Half-Open state with exponential backoff)
@@ -796,6 +813,9 @@ class AccountManager:
                 logger.debug(f"Dynamic learning: model '{normalized_model}' works on account {account_id}")
                 self._dirty = True
             
+            if self._selection != "sticky":
+                return
+            
             # GLOBAL STICKY: Update global current_account_index
             all_account_ids = list(self._accounts.keys())
             try:
@@ -841,6 +861,18 @@ class AccountManager:
                 )
                 return
             
+            # round_robin with several accounts: 429 gets a short fixed cooldown, not the breaker
+            if status_code == 429 and self._uses_rate_limit_cooldown():
+                account.cooldown_until = time.time() + ACCOUNT_RATE_LIMIT_COOLDOWN
+                account.stats.total_requests += 1
+                account.stats.failed_requests += 1
+                self._dirty = True
+                logger.warning(
+                    f"Account {account_id} rate-limited: reason={reason}, "
+                    f"cooldown={_format_duration(ACCOUNT_RATE_LIMIT_COOLDOWN)}"
+                )
+                return
+            
             # Update failure count (only for RECOVERABLE)
             if error_type == ErrorType.RECOVERABLE:
                 account.failures += 1
@@ -864,6 +896,34 @@ class AccountManager:
             # GLOBAL STICKY: Do NOT change _current_account_index on failure
             # It only changes on success (GLOBAL sticky behavior)
             # Failover happens through exclude_accounts in get_next_account()
+    
+    def _uses_rate_limit_cooldown(self) -> bool:
+        """True when 429 should trigger cooldown + failover instead of same-account retries."""
+        return self._selection == "round_robin" and len(self._accounts) > 1
+    
+    def retry_rate_limit_in_place(self) -> bool:
+        """
+        Whether request_with_retry should retry 429 on the same account.
+        
+        Returns:
+            False in round_robin with 2+ accounts (fail over instead), True otherwise
+        """
+        return not self._uses_rate_limit_cooldown()
+    
+    def rate_limit_retry_after(self) -> Optional[int]:
+        """
+        Seconds until the first rate-limited account leaves its 429 cooldown.
+        
+        Used when no account is available, to answer 429 + Retry-After instead of 503.
+        
+        Returns:
+            Seconds (>= 1) or None if no account is in 429 cooldown
+        """
+        now = time.time()
+        remaining = [a.cooldown_until - now for a in self._accounts.values() if a.cooldown_until > now]
+        if not remaining:
+            return None
+        return max(1, math.ceil(min(remaining)))
     
     def get_first_account(self) -> Account:
         """

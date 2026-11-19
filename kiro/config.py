@@ -29,6 +29,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
+from loguru import logger
 
 # Load environment variables
 load_dotenv()
@@ -529,6 +530,35 @@ ACCOUNTS_CONFIG_FILE: str = os.getenv("ACCOUNTS_CONFIG_FILE", "credentials.json"
 
 # Path to runtime state file
 ACCOUNTS_STATE_FILE: str = os.getenv("ACCOUNTS_STATE_FILE", "state.json")
+
+ACCOUNT_SELECTION_MODES = ("sticky", "round_robin")
+
+
+def _parse_account_selection(value: str) -> str:
+    """
+    Normalize ACCOUNT_SELECTION, falling back to "sticky" for unknown values.
+    
+    Args:
+        value: Raw environment value
+    
+    Returns:
+        "sticky" or "round_robin"
+    """
+    mode = value.strip().lower()
+    if mode not in ACCOUNT_SELECTION_MODES:
+        logger.warning(f"Unknown ACCOUNT_SELECTION='{value}', falling back to 'sticky' (allowed: sticky, round_robin)")
+        return "sticky"
+    return mode
+
+
+# Account selection strategy (multi-account only)
+# sticky: stay on the last successful account until it fails (default)
+# round_robin: each request starts from the next account in turn
+ACCOUNT_SELECTION: str = _parse_account_selection(os.getenv("ACCOUNT_SELECTION", "sticky"))
+
+# Fixed cooldown in seconds for an account that returned 429 (round_robin only)
+# Replaces the exponential Circuit Breaker for rate limits
+ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", "30"))
 
 # ==================================================================================================
 # Circuit Breaker Settings

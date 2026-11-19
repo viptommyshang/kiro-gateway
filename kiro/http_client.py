@@ -188,7 +188,8 @@ class KiroHttpClient:
         url: str,
         json_data: Optional[dict] = None,
         params: Optional[dict] = None,
-        stream: bool = False
+        stream: bool = False,
+        retry_on_429: bool = True
     ) -> httpx.Response:
         """
         Executes an HTTP request with retry logic.
@@ -208,6 +209,8 @@ class KiroHttpClient:
             json_data: Optional JSON body (for POST/PUT/PATCH)
             params: Optional query parameters (for GET)
             stream: Use streaming (default False)
+            retry_on_429: Retry 429 on this account (default True); when False,
+                the 429 response is returned at once so the caller can fail over
         
         Returns:
             httpx.Response with successful response
@@ -264,6 +267,9 @@ class KiroHttpClient:
                 
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
+                    if not retry_on_429:
+                        logger.warning("Received 429, not retrying on this account (failover enabled)")
+                        return response
                     await self._read_and_release(response)
                     last_response = response  # Сохраняем для возврата после exhaustion
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
