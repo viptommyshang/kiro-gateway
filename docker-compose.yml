@@ -1,11 +1,13 @@
-version: '3.8'
-
 services:
   kiro-gateway:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: kiro-gateway
+    # 必须与宿主机上 /opt/docker/kiro-gateway 的属主一致，否则 token 刷新写回
+    # 会被权限拒绝（容器能正常启动、能应答，但重启后旧 refresh_token 已失效）。
+    # root 部署用 "0:0"；普通用户填 `id -u`:`id -g` 的实际值。
+    user: "0:0"
     ports:
       - "8000:8000"
     environment:
@@ -43,15 +45,18 @@ services:
       - .env
     
     volumes:
-      # Mount credentials file (if using KIRO_CREDS_FILE)
-      # Uncomment and adjust path as needed:
-      # - ~/.aws/sso/cache:/home/kiro/.aws/sso/cache:ro
-      
-      # Mount kiro-cli database (if using KIRO_CLI_DB_FILE)
-      # Uncomment and adjust path as needed:
-      # - ~/.local/share/kiro-cli:/home/kiro/.local/share/kiro-cli  # Linux/macOS
-      
-      # Mount debug logs directory (optional, for debugging)
+      # 多账号凭证目录。必须可写：refresh_token 每次刷新都会轮换并写回 sqlite，
+      # 写不进去时容器照常运行，但重启后会拿已作废的旧 token 去刷，认证失败。
+      - /opt/docker/kiro-gateway/accounts:/app/accounts
+
+      # 账号清单。镜像构建时 Dockerfile 里有 `rm -f credentials.json`，
+      # 所以必须从宿主机挂载进来。
+      - /opt/docker/kiro-gateway/credentials.json:/app/credentials.json:ro
+
+      # 运行状态：粘性账号索引、各账号失败计数与统计。
+      # 不挂卷则容器重建后熔断状态与粘性全部重置。
+      - /opt/docker/kiro-gateway/state:/app/state
+
       - ./debug_logs:/app/debug_logs
     
     restart: unless-stopped

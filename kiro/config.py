@@ -260,9 +260,11 @@ HIDDEN_MODELS: Dict[str, str] = {
 #   }
 #
 # Default: {"auto-kiro": "auto"} to avoid Cursor IDE conflict
-MODEL_ALIASES: Dict[str, str] = {
-    "auto-kiro": "auto",  # Default alias to avoid Cursor's "auto" model conflict
-}
+# 本地改动：移除 "auto-kiro" 别名。
+# 该别名原用于规避 Cursor IDE 自带的 "auto" 模型冲突，但实测它会出现在
+# /v1/models 列表中却无法调用（返回 400 Invalid model ID），下游网关按列表
+# 注册模型时会拿到一个坏条目。本部署不使用 Cursor，直接暴露真实 ID "auto"。
+MODEL_ALIASES: Dict[str, str] = {}
 
 # Models to hide from /v1/models endpoint.
 # These models still work when requested directly, but are not shown in the model list.
@@ -274,7 +276,7 @@ MODEL_ALIASES: Dict[str, str] = {
 #   HIDDEN_FROM_LIST = ["auto", "claude-old-model"]
 #
 # Default: ["auto"] to show only "auto-kiro" alias
-HIDDEN_FROM_LIST: List[str] = ["auto"]
+HIDDEN_FROM_LIST: List[str] = []
 
 # ==================================================================================================
 # Fallback Models Configuration (DNS Failure Recovery)
@@ -287,20 +289,38 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Some models may not be available on your Kiro plan (e.g., Opus on free tier)
 # - New models released after this version won't appear here
 # - Update gateway regularly to get the latest model list
+# Source: `kiro-cli chat --list-models --format json` (kiro-cli 2.19.1, 2026-11-05).
+# Order matches kiro-cli output; "auto" is the default model.
+#
+# Inline price comments: official vendor list price in USD per 1M (1,000,000) tokens,
+# shown as "input / output" (standard tier, short-context, non-cached). These are the
+# UPSTREAM VENDOR API prices (Anthropic / OpenAI / DeepSeek / MiniMax / Z.ai / Alibaba),
+# NOT Kiro's billing (Kiro bills in credit multipliers, see kiro-cli --list-models).
+# Prices verified via vendor sites + aggregators on 2026-11-05.
+# "?" marks figures I could not confirm on an official page (vendor doesn't list that
+# exact SKU publicly, or aggregator sources disagree) - treat as approximate.
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
-    {"modelId": "claude-sonnet-4"},
-    {"modelId": "claude-sonnet-4.5"},
-    {"modelId": "claude-sonnet-4.6"},
-    {"modelId": "claude-haiku-4.5"},
-    {"modelId": "claude-opus-4.5"},
-    {"modelId": "claude-opus-4.6"},
-    {"modelId": "claude-opus-4.7"},
-    {"modelId": "deepseek-3.2"},
-    {"modelId": "glm-5"},
-    {"modelId": "minimax-m2.1"},
-    {"modelId": "minimax-m2.5"},
-    {"modelId": "qwen3-coder-next"},
+    {"modelId": "claude-opus-5.5"},     # $4.00 / $20.00  (anthropic.com)
+    {"modelId": "claude-sonnet-5.5"},   # $2.00 / $10.00  (anthropic.com)
+    {"modelId": "claude-haiku-5.5"},    # $0.10 / $0.50   (anthropic.com)
+    {"modelId": "gpt-5.6-sol"},         # $5.00 / $30.00  (openai.com)
+    {"modelId": "gpt-5.6-terra"},       # $2.00 / $12.00  (openai.com, post 2026-07-30 cut)
+    {"modelId": "gpt-5.6-luna"},        # $0.20 / $1.20   (openai.com)
+    {"modelId": "claude-opus-5"},       # $5.00 / $25.00  (Anthropic GA rate card)
+    {"modelId": "claude-sonnet-5"},     # $3.00 / $15.00  ? (Sonnet-tier norm; not on current GA page)
+    {"modelId": "claude-opus-4.8"},     # $5.00 / $25.00  (Anthropic GA rate card)
+    {"modelId": "claude-opus-4.7"},     # $5.00 / $25.00  (Anthropic, unchanged from 4.6)
+    {"modelId": "claude-opus-4.6"},     # $5.00 / $25.00  (Anthropic)
+    {"modelId": "claude-sonnet-4.6"},   # $3.00 / $15.00  (Anthropic)
+    {"modelId": "claude-opus-4.5"},     # $5.00 / $25.00  (Anthropic)
+    {"modelId": "claude-sonnet-4.5"},   # $3.00 / $15.00  (Anthropic)
+    {"modelId": "claude-haiku-4.5"},    # $1.00 / $5.00   ? (prior Haiku tier; verify on vendor page)
+    {"modelId": "deepseek-3.2"},        # $0.28 / $0.42   (DeepSeek official, cache-miss)
+    {"modelId": "minimax-m2.5"},        # $0.30 / $1.20   ? (MiniMax M2-series rate; m2.5 SKU not officially listed)
+    {"modelId": "minimax-m2.1"},        # $0.30 / $1.20   (MiniMax official)
+    {"modelId": "glm-5"},               # $0.60 / $2.69   ? (Z.ai/Zhipu; aggregator sources vary $0.57-1.00 in)
+    {"modelId": "qwen3-coder-next"},    # $0.22 / $1.00   ? (Alibaba; aggregators vary $0.11-0.22 in)
 ]
 
 # ==================================================================================================
