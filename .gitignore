@@ -34,3 +34,6 @@ htmlcov/
 
 # Agent task reports (local only)
 .agents/
+
+# macOS
+.DS_Store
