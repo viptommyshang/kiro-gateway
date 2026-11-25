@@ -47,7 +47,7 @@ from typing import Any, AsyncIterator, List, Optional
 import httpx
 from loguru import logger
 
-from kiro.parsers import AwsEventStreamParser
+from kiro.parsers import REFUSAL_EXCEPTION_TYPE, AwsEventStreamParser
 
 
 # ==================================================================================================
@@ -62,6 +62,12 @@ REASON_THROTTLED = "THROTTLED"
 
 REASON_STREAM_ERROR = "UPSTREAM_STREAM_ERROR"
 """Kiro reported a server-side failure inside the stream."""
+
+REASON_REASONING_REFUSED = "REASONING_EXTRACTION_REFUSED"
+"""The model refused the request because of the injected fake-reasoning prompt."""
+
+REASON_CONTENT_FILTERED = "CONTENT_FILTERED"
+"""The model refused the request for content reasons (not retryable)."""
 
 RETRYABLE_STREAM_REASONS = frozenset({REASON_EMPTY_RESPONSE, REASON_STREAM_ERROR})
 """Reasons where another attempt (or another account) is likely to succeed."""
@@ -194,6 +200,23 @@ def classify_stream_exception(
 
     if exception_type in _THROTTLING_EXCEPTIONS:
         return throttled
+    if exception_type == REFUSAL_EXCEPTION_TYPE:
+        if reason == "REASONING_EXTRACTION":
+            return StreamFailure(
+                status_code=400,
+                reason=REASON_REASONING_REFUSED,
+                message=(
+                    f"The model refused the request because of the gateway's fake reasoning prompt ({message}). "
+                    "Retry without it, or set FAKE_REASONING=false."
+                ),
+                exception_type=exception_type,
+            )
+        return StreamFailure(
+            status_code=400,
+            reason=REASON_CONTENT_FILTERED,
+            message=f"The model refused to answer (category: {reason or 'unknown'}): {message}",
+            exception_type=exception_type,
+        )
     if exception_type in _CLIENT_ERROR_EXCEPTIONS:
         # Keep Kiro's own reason (e.g. CONTENT_LENGTH_EXCEEDS_THRESHOLD) so the
         # existing 400 classification and friendly messages still apply.
@@ -336,6 +359,8 @@ def _has_meaningful_output(events: List[dict], parser: AwsEventStreamParser) -> 
     """
     if parser.current_tool_call is not None or parser.tool_calls:
         return True
+    # Native reasoning alone does not commit the stream: Kiro reports refusals
+    # only at the end, and committing early would make them unretryable.
     return any(event["type"] == "content" and event.get("data") for event in events)
 
 
@@ -363,6 +388,7 @@ async def probe_kiro_stream(response: httpx.Response, first_token_timeout: float
     iterator = response.aiter_bytes().__aiter__()
     consumed: List[bytes] = []
     total_bytes = 0
+    saw_reasoning = False
 
     async def close() -> None:
         try:
@@ -385,6 +411,7 @@ async def probe_kiro_stream(response: httpx.Response, first_token_timeout: float
             consumed.append(chunk)
             total_bytes += len(chunk)
             events = parser.feed(chunk)
+            saw_reasoning = saw_reasoning or any(event["type"] == "reasoning" for event in events)
 
             for event in events:
                 if event["type"] == "error":
@@ -404,8 +431,9 @@ async def probe_kiro_stream(response: httpx.Response, first_token_timeout: float
         await close()
         raise
 
-    # Stream ended. A tool call may complete only at the very end.
-    if _has_meaningful_output([], parser):
+    # Stream ended. A tool call may complete only at the very end; a
+    # reasoning-only answer is still an answer.
+    if _has_meaningful_output([], parser) or saw_reasoning:
         return ProbeResult(
             outcome=ProbeOutcome.OK,
             response=ReplayResponse(response, consumed, None),

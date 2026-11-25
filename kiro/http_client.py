@@ -50,7 +50,14 @@ from kiro.config import (
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
-from kiro.stream_validation import ProbeOutcome, build_failure_response, probe_kiro_stream
+from kiro import fake_reasoning_policy
+from kiro.converters_core import get_thinking_system_prompt_addition
+from kiro.stream_validation import (
+    REASON_REASONING_REFUSED,
+    ProbeOutcome,
+    build_failure_response,
+    probe_kiro_stream,
+)
 
 
 class KiroHttpClient:
@@ -244,6 +251,7 @@ class KiroHttpClient:
         last_error_info: Optional[NetworkErrorInfo] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
         first_token_timeouts = 0
+        reasoning_fallback_used = False
         validate_stream = validate_stream and STREAM_VALIDATION_ENABLED
         
         for attempt in range(max_retries):
@@ -292,6 +300,19 @@ class KiroHttpClient:
                     failure = probe.failure
                     assert failure is not None
                     synthetic = build_failure_response(failure, response.request)
+                    
+                    if (
+                        failure.reason == REASON_REASONING_REFUSED
+                        and not reasoning_fallback_used
+                        and isinstance(json_data, dict)
+                    ):
+                        reasoning_fallback_used = True
+                        fake_reasoning_policy.mark_refused(fake_reasoning_policy.get_payload_model_id(json_data))
+                        # In place: callers that retry with the same payload benefit too
+                        if fake_reasoning_policy.strip_fake_reasoning(json_data, get_thinking_system_prompt_addition()):
+                            logger.warning("Retrying immediately without the fake reasoning prompt")
+                            last_response = synthetic  # Reported if no attempt is left
+                            continue
                     
                     if not failure.is_retryable:
                         logger.warning(

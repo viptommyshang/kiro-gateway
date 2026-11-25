@@ -43,6 +43,10 @@ from kiro.aws_eventstream import (
 from kiro.utils import generate_tool_call_id
 
 
+REFUSAL_EXCEPTION_TYPE = "ContentRefusal"
+"""Synthetic exception type for refusals reported in a ``metadataEvent``."""
+
+
 def find_matching_brace(text: str, start_pos: int) -> int:
     """
     Finds the position of the closing brace considering nesting and strings.
@@ -229,7 +233,8 @@ class AwsEventStreamParser:
     - tool_stop: End of tool call
     - usage: Credit consumption information
     - context_usage: Context usage percentage
-    - error: In-stream exception (binary frames only), e.g. ThrottlingException
+    - error: In-stream exception or refusal (binary frames only), e.g. ThrottlingException
+    - reasoning: Native model reasoning text (reasoningContentEvent, binary frames only)
     
     Attributes:
         buffer: Buffer for accumulating data
@@ -272,6 +277,8 @@ class AwsEventStreamParser:
         self._mode: Optional[str] = None
         self._pending = bytearray()
         self._decoder = EventStreamDecoder()
+        # Set by the streaming layer once native reasoning has been emitted
+        self.native_reasoning_started = False
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
@@ -376,6 +383,12 @@ class AwsEventStreamParser:
             return [error_event]
         
         event_type = frame.event_type
+        if event_type == "metadataEvent":
+            refusal_event = self._process_metadata_frame(payload_text)
+            return [refusal_event] if refusal_event else []
+        if event_type == "reasoningContentEvent":
+            reasoning_event = self._process_reasoning_frame(payload_text)
+            return [reasoning_event] if reasoning_event else []
         if event_type in self.ERROR_EVENT_TYPES:
             error_event = self._build_error_event(event_type, payload_text, None)
             logger.warning(
@@ -390,6 +403,87 @@ class AwsEventStreamParser:
         elif leftover.strip():
             logger.debug(f"Unparsed remainder in Kiro event '{event_type}': {leftover[:200]}")
         return events
+    
+    @staticmethod
+    def _load_json_object(payload_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Parses a frame payload that is expected to be a JSON object.
+        
+        Args:
+            payload_text: Frame payload as text
+        
+        Returns:
+            Parsed dict, or None if the payload is empty, invalid or not an object
+        """
+        if not payload_text.strip():
+            return None
+        try:
+            data = json.loads(payload_text)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse Kiro frame payload: {payload_text[:100]}")
+            return None
+        return data if isinstance(data, dict) else None
+    
+    def _process_metadata_frame(self, payload_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Inspects a ``metadataEvent`` for a model refusal.
+        
+        Kiro reports refusals (e.g. ``REASONING_EXTRACTION``) only here, as
+        ``stopReason: CONTENT_FILTERED`` plus ``stopDetails.refusal`` inside an
+        HTTP 200 stream that carries no content. Without this check the
+        client gets an empty "successful" answer.
+        
+        Args:
+            payload_text: Frame payload as text
+        
+        Returns:
+            ``error`` event for refusals, otherwise None
+        """
+        data = self._load_json_object(payload_text)
+        if data is None:
+            return None
+        stop_details = data.get("stopDetails")
+        refusal = stop_details.get("refusal") if isinstance(stop_details, dict) else None
+        if not isinstance(refusal, dict) and data.get("stopReason") != "CONTENT_FILTERED":
+            return None
+        
+        refusal = refusal if isinstance(refusal, dict) else {}
+        category = refusal.get("category")
+        explanation = refusal.get("explanation")
+        event = {
+            "type": "error",
+            "data": {
+                "exception_type": REFUSAL_EXCEPTION_TYPE,
+                "message": explanation if isinstance(explanation, str) and explanation else "The model refused to answer",
+                "reason": category if isinstance(category, str) and category else str(data.get("stopReason") or "CONTENT_FILTERED"),
+            },
+        }
+        logger.warning(
+            f"Kiro API stream refusal: category={event['data']['reason']}, "
+            f"message={event['data']['message'][:200]}"
+        )
+        return event
+    
+    def _process_reasoning_frame(self, payload_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Converts a native ``reasoningContentEvent`` into a ``reasoning`` event.
+        
+        Kiro streams the model's own reasoning as ``{"text": "..."}`` frames,
+        followed by a ``{"signature": "..."}`` frame that carries no text.
+        
+        Args:
+            payload_text: Frame payload as text
+        
+        Returns:
+            ``reasoning`` event, or None for signature/empty frames
+        """
+        data = self._load_json_object(payload_text)
+        if data is None:
+            return None
+        text = data.get("text")
+        if not isinstance(text, str) or not text:
+            return None
+        return {"type": "reasoning", "data": text}
     
     def _is_known_silent_payload(self, payload_text: str) -> bool:
         """

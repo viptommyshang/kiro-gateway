@@ -27,8 +27,11 @@ from fastapi import HTTPException
 from kiro.account_errors import ErrorType, classify_error
 from kiro.aws_eventstream import encode_frame
 from kiro.http_client import KiroHttpClient
+from kiro.parsers import REFUSAL_EXCEPTION_TYPE
 from kiro.stream_validation import (
+    REASON_CONTENT_FILTERED,
     REASON_EMPTY_RESPONSE,
+    REASON_REASONING_REFUSED,
     REASON_STREAM_ERROR,
     REASON_THROTTLED,
     KiroStreamError,
@@ -63,6 +66,21 @@ def exception_frame(exception_type: str, message: str) -> bytes:
     return encode_frame(
         {":message-type": "exception", ":exception-type": exception_type},
         json.dumps({"message": message}).encode("utf-8"),
+    )
+
+
+def refusal_frame(category: str, explanation: str = "refused") -> bytes:
+    payload = json.dumps({
+        "stopDetails": {"refusal": {"category": category, "explanation": explanation}},
+        "stopReason": "CONTENT_FILTERED",
+    }).encode("utf-8")
+    return encode_frame({":message-type": "event", ":event-type": "metadataEvent"}, payload)
+
+
+def reasoning_frame(text: str) -> bytes:
+    return encode_frame(
+        {":message-type": "event", ":event-type": "reasoningContentEvent"},
+        json.dumps({"text": text}).encode("utf-8"),
     )
 
 
@@ -584,3 +602,123 @@ class TestLegacyModeEndToEnd:
 
         assert response.status_code == 200, response.text
         assert "legacy ok" in response.text
+
+
+class TestRefusalClassification:
+    """Refusals reported in metadataEvent (real Kiro behaviour, not throttling)."""
+
+    def test_reasoning_extraction_is_retryable_without_injection(self):
+        failure = classify_stream_exception(REFUSAL_EXCEPTION_TYPE, "refused", "REASONING_EXTRACTION")
+        assert failure.status_code == 400
+        assert failure.reason == REASON_REASONING_REFUSED
+        # Not a rate limit, not blindly retried on another account
+        assert not failure.is_rate_limit
+
+    def test_other_refusal_is_content_filtered(self):
+        failure = classify_stream_exception(REFUSAL_EXCEPTION_TYPE, "blocked", "CONTENT_FILTERED")
+        assert failure.status_code == 400
+        assert failure.reason == REASON_CONTENT_FILTERED
+        assert not failure.is_retryable
+
+
+class TestProbeRefusalAndReasoning:
+    @pytest.mark.asyncio
+    async def test_reasoning_extraction_refusal_reports_error(self):
+        """
+        What it does: a 200 stream whose only content is the REASONING_EXTRACTION
+        refusal metadataEvent (the captured production symptom).
+        Purpose: probe returns ERROR with the retry-without-injection reason.
+        """
+        response = make_response([context_frame(), refusal_frame("REASONING_EXTRACTION")])
+        result = await probe_kiro_stream(response, first_token_timeout=1)
+        assert result.outcome == ProbeOutcome.ERROR
+        assert result.failure.reason == REASON_REASONING_REFUSED
+        response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_native_reasoning_only_answer_is_ok(self):
+        """
+        What it does: a stream with reasoning frames and no assistantResponse content
+        (seen on some GPT answers), ending normally.
+        Purpose: a reasoning-only answer must not be treated as empty.
+        """
+        response = make_response([reasoning_frame("thinking..."), reasoning_frame(" more"), metering_frame()])
+        result = await probe_kiro_stream(response, first_token_timeout=1)
+        assert result.outcome == ProbeOutcome.OK
+        assert await result.response.aread()  # replays the bytes
+
+    @pytest.mark.asyncio
+    async def test_reasoning_then_refusal_still_reports_error(self):
+        """Native reasoning does not commit the stream; a later refusal still wins."""
+        response = make_response([reasoning_frame("thinking"), refusal_frame("REASONING_EXTRACTION")])
+        result = await probe_kiro_stream(response, first_token_timeout=1)
+        assert result.outcome == ProbeOutcome.ERROR
+        assert result.failure.reason == REASON_REASONING_REFUSED
+
+    @pytest.mark.asyncio
+    async def test_reasoning_then_content_is_ok(self):
+        response = make_response([reasoning_frame("r"), content_frame("answer"), metering_frame()])
+        result = await probe_kiro_stream(response, first_token_timeout=1)
+        assert result.outcome == ProbeOutcome.OK
+
+
+class TestReasoningFallbackInHttpClient:
+    @pytest.mark.asyncio
+    async def test_refused_request_is_retried_without_injection(self):
+        """
+        What it does: first attempt refuses (REASONING_EXTRACTION), the client strips the
+        injected prompt from the payload and the retry returns content.
+        Purpose: opus-style refusals recover transparently in one request.
+        """
+        from kiro.converters_core import get_thinking_system_prompt_addition
+
+        client, shared = _http_client([
+            make_response([refusal_frame("REASONING_EXTRACTION")]),
+            make_response([content_frame("pong"), metering_frame()]),
+        ])
+        addition = get_thinking_system_prompt_addition()
+        prefix = (
+            "<thinking_mode>enabled</thinking_mode>\n"
+            "<max_thinking_length>8000</max_thinking_length>\n"
+            "<thinking_instruction>x</thinking_instruction>\n\n"
+        )
+        payload = {
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {"content": prefix + "hi" + addition, "modelId": "claude-opus-5.5"}
+                }
+            }
+        }
+        with patch("kiro.http_client.asyncio.sleep", AsyncMock()):
+            response = await client.request_with_retry("POST", "u", payload, stream=True, validate_stream=True)
+
+        assert response.status_code == 200
+        assert b"pong" in await response.aread()
+        assert shared.send.await_count == 2
+        # Payload was stripped in place so a caller retry reuses the clean version
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "<thinking_mode>" not in content
+
+    @pytest.mark.asyncio
+    async def test_model_marked_refused_skips_injection_next_time(self):
+        from kiro import fake_reasoning_policy
+
+        fake_reasoning_policy.reset_for_testing()
+        try:
+            client, _ = _http_client([make_response([refusal_frame("REASONING_EXTRACTION")]),
+                                      make_response([content_frame("ok"), metering_frame()])])
+            payload = {
+                "conversationState": {
+                    "currentMessage": {
+                        "userInputMessage": {"content": "<thinking_mode>enabled</thinking_mode>\n"
+                                             "<max_thinking_length>1</max_thinking_length>\n"
+                                             "<thinking_instruction>x</thinking_instruction>\n\nhi",
+                                             "modelId": "claude-opus-5.5"}
+                    }
+                }
+            }
+            with patch("kiro.http_client.asyncio.sleep", AsyncMock()):
+                await client.request_with_retry("POST", "u", payload, stream=True, validate_stream=True)
+            assert fake_reasoning_policy.should_inject("claude-opus-5.5") is False
+        finally:
+            fake_reasoning_policy.reset_for_testing()

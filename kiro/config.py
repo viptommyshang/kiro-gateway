@@ -592,6 +592,12 @@ ACCOUNT_SELECTION: str = _parse_account_selection(os.getenv("ACCOUNT_SELECTION",
 # Replaces the exponential Circuit Breaker for rate limits
 ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", "30"))
 
+# Seconds to skip fake reasoning injection for a model after it refused it
+# (Kiro refusal category REASONING_EXTRACTION, e.g. claude-opus-5.5). The
+# refused request is retried once without injection; later requests for that
+# model skip injection until the cooldown ends. Default: 6 hours.
+FAKE_REASONING_REFUSAL_TTL: int = max(1, int(os.getenv("FAKE_REASONING_REFUSAL_TTL", "21600")))
+
 # Maximum concurrent in-flight requests per account (0 = unlimited, default).
 # Kiro throttles accounts that run too many generations at once (often as an
 # in-stream exception or an empty 200). With a cap, requests are spread over

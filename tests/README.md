@@ -85,6 +85,7 @@ tests/
 │   ├── test_debug_logger.py        # DebugLogger tests (off/errors/all modes)
 │   ├── test_debug_middleware.py    # DebugLoggerMiddleware tests (endpoint filtering, mode handling)
 │   ├── test_exceptions.py          # Exception handlers tests (validation_exception_handler, sanitize_validation_errors)
+│   ├── test_fake_reasoning_policy.py # Per-model fake-reasoning refusal registry and payload stripping
 │   ├── test_http_client.py         # KiroHttpClient tests (including params parameter for Account System)
 │   ├── test_kiro_errors.py         # Kiro API error enhancement tests (CONTENT_LENGTH_EXCEEDS_THRESHOLD, unknown errors)
 │   ├── test_main_cli.py            # CLI argument parsing tests (--host, --port)

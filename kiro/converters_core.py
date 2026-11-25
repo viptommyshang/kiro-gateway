@@ -44,6 +44,7 @@ from kiro.config import (
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
+from kiro import fake_reasoning_policy
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
 
@@ -1443,8 +1444,15 @@ def build_kiro_payload(
     if tool_documentation:
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
-    # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
+    # Models that refused the fake-reasoning prompt get neither the system
+    # addition nor the thinking tags (see kiro.fake_reasoning_policy)
+    if not fake_reasoning_policy.should_inject(model_id):
+        logger.debug(f"Skipping fake reasoning injection for model '{model_id}' (refused recently)")
+        thinking_config = ThinkingConfig(enabled=False, budget_tokens=thinking_config.budget_tokens)
+        thinking_system_addition = ""
+    else:
+        # Add thinking mode legitimization to system prompt if enabled
+        thinking_system_addition = get_thinking_system_prompt_addition()
     if thinking_system_addition:
         full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     

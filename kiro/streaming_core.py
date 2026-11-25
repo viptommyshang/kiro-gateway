@@ -287,6 +287,17 @@ async def _process_chunk(
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
         
+        elif event["type"] == "reasoning":
+            # Native model reasoning (reasoningContentEvent): already separated
+            # from the answer by Kiro, so it bypasses the fake-reasoning tag parser
+            is_first = not parser.native_reasoning_started
+            parser.native_reasoning_started = True
+            yield KiroEvent(
+                type="thinking",
+                thinking_content=event["data"],
+                is_first_thinking_chunk=is_first,
+            )
+        
         elif event["type"] == "error":
             yield KiroEvent(type="error", error=event["data"])
 

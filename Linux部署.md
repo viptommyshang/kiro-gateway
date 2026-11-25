@@ -413,6 +413,8 @@ FAKE_REASONING=false
 | 请求体过大报错 | `.env` 加 `AUTO_TRIM_PAYLOAD=true` |
 | 日志 `Kiro API returned HTTP 200 without any content` | Kiro 给了空回复，网关已自动重试/切号；频繁出现说明账号被限流，加账号或设 `ACCOUNT_MAX_CONCURRENCY` |
 | 日志 `Kiro API stream exception: type=ThrottlingException` | 流内限流，按 429 处理（冷却 + 切号）；同上 |
+| 日志 `Kiro API stream refusal: category=REASONING_EXTRACTION` | 该模型（如 claude-opus-5.5）拒绝了扩展思考注入。网关会自动去掉注入重试一次，并在 `FAKE_REASONING_REFUSAL_TTL`（默认 6 小时）内对该模型跳过注入；无需处理。彻底关闭用 `FAKE_REASONING=false` |
+| 日志 `Kiro API stream refusal: category=CONTENT_FILTERED` + `access ... temporarily restricted` | 账号因短时间内触发过多拒绝被 Kiro 临时限制；等待或换账号，别再用该模型密集压测 |
 | `503 All N Kiro account(s) are busy` | 全部账号达到 `ACCOUNT_MAX_CONCURRENCY` 且排队超时，加账号或调大上限/排队时间 |
 | `504 Model did not respond within 15s` | 大请求首 token 慢，调大 `FIRST_TOKEN_TIMEOUT` |
 

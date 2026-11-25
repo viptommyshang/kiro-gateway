@@ -1536,3 +1536,70 @@ class TestAwsEventStreamParserModeDetection:
         parser = AwsEventStreamParser()
         assert parser.feed(b"") == []
         assert parser._mode is None
+
+
+# ==================================================================================================
+# metadataEvent refusals and native reasoningContentEvent (observed on real Kiro traffic)
+# ==================================================================================================
+
+from kiro.parsers import REFUSAL_EXCEPTION_TYPE  # noqa: E402
+
+
+class TestAwsEventStreamParserRefusalAndReasoning:
+    """Kiro reports refusals in metadataEvent and native reasoning in reasoningContentEvent."""
+
+    def test_reasoning_extraction_refusal_becomes_error(self):
+        """
+        What it does: Feeds the exact metadataEvent Kiro returns when it refuses
+        the fake-reasoning prompt (captured from real traffic).
+        Purpose: This 200-with-no-content refusal must surface as an error, not an empty success.
+        """
+        parser = AwsEventStreamParser()
+        payload = (
+            '{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION",'
+            '"explanation":"The selected model cannot continue this conversation."}},'
+            '"stopReason":"CONTENT_FILTERED"}'
+        )
+        events = parser.feed(_frame(payload, "metadataEvent"))
+        assert events == [{
+            "type": "error",
+            "data": {
+                "exception_type": REFUSAL_EXCEPTION_TYPE,
+                "message": "The selected model cannot continue this conversation.",
+                "reason": "REASONING_EXTRACTION",
+            },
+        }]
+
+    def test_content_filtered_without_refusal_block(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"stopReason":"CONTENT_FILTERED"}', "metadataEvent"))
+        assert events[0]["type"] == "error"
+        assert events[0]["data"]["reason"] == "CONTENT_FILTERED"
+
+    def test_normal_metadata_is_not_an_error(self):
+        parser = AwsEventStreamParser()
+        assert parser.feed(_frame('{"stopReason":"END_TURN"}', "metadataEvent")) == []
+
+    def test_native_reasoning_frames_emit_reasoning_events(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"text":"Let me think"}', "reasoningContentEvent"))
+        events += parser.feed(_frame('{"text":" step by step"}', "reasoningContentEvent"))
+        assert events == [
+            {"type": "reasoning", "data": "Let me think"},
+            {"type": "reasoning", "data": " step by step"},
+        ]
+
+    def test_reasoning_signature_frame_is_silent(self):
+        parser = AwsEventStreamParser()
+        sig = '{"signature":"CAQSjgYKEggUEAEYAjgBQgh0aGlua2luZw=="}'
+        assert parser.feed(_frame(sig, "reasoningContentEvent")) == []
+
+    def test_reasoning_then_content_then_metadata(self):
+        """A GPT-style answer: native reasoning, then the answer, then END_TURN."""
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"text":"reasoning"}', "reasoningContentEvent"))
+        events += parser.feed(_frame('{"content":"answer"}', "assistantResponseEvent"))
+        events += parser.feed(_frame('{"stopReason":"END_TURN"}', "metadataEvent"))
+        assert [e["type"] for e in events] == ["reasoning", "content"]
+        assert events[0]["data"] == "reasoning"
+        assert events[1]["data"] == "answer"
