@@ -335,6 +335,14 @@ async def messages(
             )
             
             if account is None:
+                if account_manager.all_accounts_busy():
+                    detail = account_manager.busy_message()
+                    logger.warning(f"HTTP 503 - POST /v1/messages - {detail[:100]}")
+                    return JSONResponse(
+                        status_code=503,
+                        headers={"Retry-After": "5"},
+                        content={"type": "error", "error": {"type": "overloaded_error", "message": detail}}
+                    )
                 # All accounts unavailable
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
@@ -384,6 +392,8 @@ async def messages(
             
             # Mark account as tried in current failover loop
             tried_accounts.add(account.id)
+            # get_next_account reserved a concurrency slot; every exit path below returns it
+            lease = account_manager.lease(account.id)
             
             # Use objects from account
             auth_manager = account.auth_manager
@@ -404,6 +414,7 @@ async def messages(
                     profile_arn_for_payload
                 )
             except ValueError as e:
+                lease.release()
                 logger.error(f"Conversion error: {e}")
                 return JSONResponse(
                     status_code=400,
@@ -418,8 +429,9 @@ async def messages(
             
             # Log Kiro payload
             try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-                if debug_logger:
+                # Serializing large payloads is CPU-bound on the event loop; skip it unless needed
+                if debug_logger and debug_logger.enabled:
+                    kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
                     debug_logger.log_kiro_request_body(kiro_request_body)
             except Exception as e:
                 logger.warning(f"Failed to log Kiro request: {e}")
@@ -449,7 +461,8 @@ async def messages(
                     url,
                     kiro_payload,
                     stream=True,
-                    retry_on_429=account_manager.retry_rate_limit_in_place()
+                    retry_on_429=account_manager.retry_rate_limit_in_place(),
+                    validate_stream=True
                 )
                 
                 if response.status_code == 200:
@@ -457,14 +470,16 @@ async def messages(
                     await account_manager.report_success(account.id, request_data.model)
                     
                     if request_data.stream:
-                        # Streaming mode
+                        # Streaming mode: the stream now owns the account slot
+                        stream_lease = lease.transfer()
+                        
                         async def stream_wrapper():
                             streaming_error = None
                             client_disconnected = False
                             try:
                                 async def make_retry_request():
                                     return await http_client.request_with_retry(
-                                        "POST", url, kiro_payload, stream=True
+                                        "POST", url, kiro_payload, stream=True, validate_stream=True
                                     )
                                 
                                 async for chunk in stream_with_first_token_retry_anthropic(
@@ -489,6 +504,7 @@ async def messages(
                                 except Exception:
                                     pass
                             finally:
+                                stream_lease.release()
                                 await http_client.close()
                                 if streaming_error:
                                     error_type = type(streaming_error).__name__
@@ -643,6 +659,9 @@ async def messages(
                         }
                     }
                 )
+            finally:
+                # No-op when the slot was handed over to a stream
+                lease.release()
         
         # All attempts exhausted
         if len(all_accounts) == 1:
@@ -727,8 +746,9 @@ async def messages(
     
     # Log Kiro payload
     try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
+        # Serializing large payloads is CPU-bound on the event loop; skip it unless needed
+        if debug_logger and debug_logger.enabled:
+            kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
             debug_logger.log_kiro_request_body(kiro_request_body)
     except Exception as e:
         logger.warning(f"Failed to log Kiro request: {e}")
@@ -766,7 +786,8 @@ async def messages(
             "POST",
             url,
             kiro_payload,
-            stream=True
+            stream=True,
+            validate_stream=True
         )
         
         if response.status_code != 200:
@@ -821,7 +842,7 @@ async def messages(
                     # Create retry request function for retries
                     async def make_retry_request():
                         return await http_client.request_with_retry(
-                            "POST", url, kiro_payload, stream=True
+                            "POST", url, kiro_payload, stream=True, validate_stream=True
                         )
                     
                     # Use retry wrapper with initial response

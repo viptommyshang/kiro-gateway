@@ -277,6 +277,22 @@ ACCOUNT_PROBABILISTIC_RETRY_CHANCE=0.1
 想把流量平均分到多个账号，再加 `ACCOUNT_SELECTION=round_robin`（默认 `sticky`），
 取舍见 `账号更换.md` 第 6 节。
 
+并发与稳定性（可选，默认值即可上线）：
+
+```bash
+# Kiro 对单账号同时进行的生成数有限制，超限时常见现象是 HTTP 200 但内容为空，
+# 或流内 ThrottlingException。设上限后请求会优先分到有空位的账号，全满时排队。
+# 总并发 ≈ 账号数 × ACCOUNT_MAX_CONCURRENCY。0 = 不限（默认）。
+ACCOUNT_MAX_CONCURRENCY=0
+ACCOUNT_QUEUE_TIMEOUT=60          # 全部账号满载时最多排队秒数，超时返回 503 + Retry-After
+
+# 默认开启：200 空响应 / 流内异常 → 同账号重试或切换账号，最终返回 429/502，不再给调用方空回复
+STREAM_VALIDATION_ENABLED=true
+
+# 大上下文首 token 慢时调大（默认 15 秒，超时会重试 FIRST_TOKEN_MAX_RETRIES 次）
+FIRST_TOKEN_TIMEOUT=15
+```
+
 同一组织下的账号 ARN 通常相同，配一次即可。若两个账号 ARN 不同，改用
 `credentials.json` 的 per-account `profile_arn` 字段分别指定。
 
@@ -395,6 +411,10 @@ FAKE_REASONING=false
 | `401` | 核对 `PROXY_API_KEY` |
 | 流式一次性返回 | 中间层有缓冲，Nginx 加 `proxy_buffering off` |
 | 请求体过大报错 | `.env` 加 `AUTO_TRIM_PAYLOAD=true` |
+| 日志 `Kiro API returned HTTP 200 without any content` | Kiro 给了空回复，网关已自动重试/切号；频繁出现说明账号被限流，加账号或设 `ACCOUNT_MAX_CONCURRENCY` |
+| 日志 `Kiro API stream exception: type=ThrottlingException` | 流内限流，按 429 处理（冷却 + 切号）；同上 |
+| `503 All N Kiro account(s) are busy` | 全部账号达到 `ACCOUNT_MAX_CONCURRENCY` 且排队超时，加账号或调大上限/排队时间 |
+| `504 Model did not respond within 15s` | 大请求首 token 慢，调大 `FIRST_TOKEN_TIMEOUT` |
 
 ## 维护
 

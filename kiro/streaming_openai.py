@@ -66,7 +66,44 @@ except ImportError:
 
 
 # Re-export FirstTokenTimeoutError for backward compatibility
-__all__ = ['FirstTokenTimeoutError', 'stream_kiro_to_openai', 'stream_with_first_token_retry', 'collect_stream_response']
+__all__ = [
+    'FirstTokenTimeoutError',
+    'stream_kiro_to_openai',
+    'stream_with_first_token_retry',
+    'collect_stream_response',
+    'format_openai_stream_error',
+]
+
+
+def format_openai_stream_error(error: BaseException) -> str:
+    """
+    Formats a mid-stream failure as an OpenAI-style SSE error chunk.
+    
+    Once a streaming response has started, the HTTP status can no longer
+    change. Without an explicit error chunk the client only sees ``[DONE]``
+    and treats the (possibly empty) partial answer as a success. OpenAI SDKs
+    and OpenAI-compatible gateways raise on a ``{"error": {...}}`` data chunk.
+    
+    Args:
+        error: Exception that terminated the stream
+    
+    Returns:
+        SSE line ``data: {"error": {...}}``
+    """
+    if isinstance(error, HTTPException):
+        message = str(error.detail)
+        code = error.status_code
+    else:
+        message = str(error) or type(error).__name__
+        code = 502
+    payload = {
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+            "code": code,
+        }
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 async def stream_kiro_to_openai_internal(

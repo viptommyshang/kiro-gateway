@@ -399,6 +399,17 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 
+# Validate Kiro streams before committing them to the client.
+# Kiro answers HTTP 200 even when generation fails: throttling/capacity errors
+# arrive as exception frames inside the body, or the body carries no content.
+# When enabled (default), the gateway reads each stream until the first content
+# or tool call; empty or failed streams are retried / failed over like HTTP
+# 429/5xx and finally reported as a proper error instead of an empty "success".
+# Set to false to restore the raw pass-through behavior.
+STREAM_VALIDATION_ENABLED: bool = os.getenv("STREAM_VALIDATION_ENABLED", "true").lower() not in (
+    "false", "0", "no", "off", "disabled"
+)
+
 # ==================================================================================================
 # Debug Settings
 # ==================================================================================================
@@ -580,6 +591,17 @@ ACCOUNT_SELECTION: str = _parse_account_selection(os.getenv("ACCOUNT_SELECTION",
 # Fixed cooldown in seconds for an account that returned 429 (round_robin only)
 # Replaces the exponential Circuit Breaker for rate limits
 ACCOUNT_RATE_LIMIT_COOLDOWN: int = int(os.getenv("ACCOUNT_RATE_LIMIT_COOLDOWN", "30"))
+
+# Maximum concurrent in-flight requests per account (0 = unlimited, default).
+# Kiro throttles accounts that run too many generations at once (often as an
+# in-stream exception or an empty 200). With a cap, requests are spread over
+# accounts that still have free slots and queue (see ACCOUNT_QUEUE_TIMEOUT)
+# when every account is busy, instead of hammering a saturated account.
+ACCOUNT_MAX_CONCURRENCY: int = max(0, int(os.getenv("ACCOUNT_MAX_CONCURRENCY", "0")))
+
+# Seconds a request waits for a free account slot when all accounts are at
+# ACCOUNT_MAX_CONCURRENCY before failing with 503. Ignored when the cap is 0.
+ACCOUNT_QUEUE_TIMEOUT: float = max(0.0, float(os.getenv("ACCOUNT_QUEUE_TIMEOUT", "60")))
 
 # ==================================================================================================
 # Circuit Breaker Settings

@@ -41,7 +41,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from loguru import logger
@@ -59,6 +59,8 @@ from kiro.config import (
     ACCOUNT_CACHE_TTL,
     ACCOUNT_SELECTION,
     ACCOUNT_RATE_LIMIT_COOLDOWN,
+    ACCOUNT_MAX_CONCURRENCY,
+    ACCOUNT_QUEUE_TIMEOUT,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
 )
@@ -155,6 +157,7 @@ class Account:
         last_failure_time: Timestamp of last failure
         models_cached_at: Timestamp of last model cache update
         cooldown_until: Rate-limit (429) cooldown end timestamp (round_robin, not persisted)
+        in_flight: Requests currently holding a slot on this account (not persisted)
         stats: Usage statistics
     """
     id: str
@@ -165,6 +168,7 @@ class Account:
     last_failure_time: float = 0.0
     models_cached_at: float = 0.0
     cooldown_until: float = 0.0
+    in_flight: int = 0
     stats: AccountStats = field(default_factory=AccountStats)
 
 
@@ -179,6 +183,75 @@ class ModelAccountList:
     Note: next_index removed - now using global _current_account_index
     """
     accounts: List[str] = field(default_factory=list)
+
+
+class AccountLease:
+    """
+    A request's claim on one concurrency slot of an account.
+    
+    ``AccountManager.get_next_account`` reserves the slot; the caller owns
+    this lease and must release it when the upstream request is finished
+    (for streams: when the stream ends). ``release`` is idempotent, and a
+    lease that is garbage-collected unreleased (e.g. a StreamingResponse
+    whose body was never iterated because the client went away) releases
+    itself so slots cannot leak.
+    
+    Example:
+        >>> account = await manager.get_next_account(model)
+        >>> lease = manager.lease(account.id)
+        >>> try:
+        ...     ...  # call Kiro
+        ... finally:
+        ...     lease.release()
+    """
+    
+    def __init__(self, manager: "AccountManager", account_id: str) -> None:
+        """
+        Args:
+            manager: Manager that reserved the slot
+            account_id: Account whose slot this lease holds
+        """
+        self._manager = manager
+        self.account_id = account_id
+        self._released = False
+    
+    @property
+    def released(self) -> bool:
+        """True once the slot has been returned (or handed over)."""
+        return self._released
+    
+    def release(self) -> None:
+        """Returns the slot to the account (no-op if already released)."""
+        if self._released:
+            return
+        self._released = True
+        self._manager._release_slot(self.account_id)
+    
+    def transfer(self) -> "AccountLease":
+        """
+        Hands the slot over to a new lease (e.g. to a streaming generator).
+        
+        After this call releasing the old lease does nothing; the returned
+        lease owns the slot.
+        
+        Returns:
+            New lease owning the slot
+        """
+        if self._released:
+            # Nothing to hand over; return an already-released lease
+            successor = AccountLease(self._manager, self.account_id)
+            successor._released = True
+            return successor
+        self._released = True
+        return AccountLease(self._manager, self.account_id)
+    
+    def __del__(self) -> None:
+        """Safety net: never leak a slot."""
+        if not self._released:
+            try:
+                self.release()
+            except Exception:  # noqa: BLE001 - never raise from a finalizer
+                pass
 
 
 class AccountManager:
@@ -218,6 +291,12 @@ class AccountManager:
         self._current_account_index: int = 0  # GLOBAL sticky index for all models
         self._selection: str = ACCOUNT_SELECTION
         self._rr_cursor: int = 0  # Next start index for round_robin
+        # Per-account cap on concurrent requests (0 = unlimited)
+        self._max_concurrency: int = ACCOUNT_MAX_CONCURRENCY
+        self._queue_timeout: float = ACCOUNT_QUEUE_TIMEOUT
+        self._slot_released = asyncio.Event()
+        # Serializes (re)initialization per account without blocking the global lock
+        self._init_locks: Dict[str, asyncio.Lock] = {}
     
     async def load_credentials(self) -> None:
         """
@@ -651,14 +730,24 @@ class AccountManager:
     
     async def get_next_account(self, model: str, exclude_accounts: Optional[set] = None) -> Optional[Account]:
         """
-        Get next available account for model (Circuit Breaker + Sticky).
+        Get next available account for model (Circuit Breaker + Sticky/Round Robin).
         
         Implements:
-        - Sticky behavior (prefer successful account)
+        - Sticky or round_robin selection (ACCOUNT_SELECTION)
         - Circuit Breaker with exponential backoff
         - Probabilistic retry for "dead" accounts (10%)
+        - Rate-limit (429) cooldown skipping
+        - Per-account concurrency cap with queueing (ACCOUNT_MAX_CONCURRENCY)
         - TTL-based model cache refresh
         - Exclusion of already-tried accounts in current failover loop
+        
+        The returned account has one concurrency slot reserved for the caller.
+        Wrap it with ``lease(account.id)`` and release the lease when the
+        upstream request finishes.
+        
+        Selection runs under the global lock, but account initialization and
+        model refresh (network calls) do not, so one slow or dead account can
+        no longer stall every concurrent request.
         
         Args:
             model: Model name (will be normalized)
@@ -667,117 +756,229 @@ class AccountManager:
         Returns:
             Account object or None if no accounts available
         """
-        async with self._lock:
-            # Special case: single account - bypass Circuit Breaker
-            # Circuit Breaker is meaningless for single account - user should see real Kiro API errors
-            # instead of generic "Account unavailable" after cooldown kicks in
-            if len(self._accounts) == 1:
-                account_id = list(self._accounts.keys())[0]
-                account = self._accounts[account_id]
-                
-                # Skip if already tried in current failover loop
-                if exclude_accounts and account_id in exclude_accounts:
+        excluded = set(exclude_accounts or ())
+        # Round robin advances once per new request, not per failover/retry pick
+        advance_cursor = not exclude_accounts
+        deadline: Optional[float] = None
+        
+        while True:
+            async with self._lock:
+                account, saturated = self._select_account(excluded, advance_cursor)
+                advance_cursor = False
+                if account is not None:
+                    account.in_flight += 1
+                elif saturated:
+                    # Armed under the lock: a release after this point wakes us up
+                    self._slot_released.clear()
+            
+            if account is None:
+                if not saturated:
                     return None
-                
-                # Lazy initialization if needed
-                if account.auth_manager is None:
-                    success = await self._initialize_account(account_id)
-                    if not success:
+                if deadline is None:
+                    deadline = time.monotonic() + self._queue_timeout
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        f"All accounts busy (ACCOUNT_MAX_CONCURRENCY={self._max_concurrency}) "
+                        f"for {self._queue_timeout:.0f}s, giving up"
+                    )
+                    return None
+                logger.debug(f"All accounts at concurrency cap, waiting up to {remaining:.1f}s for a free slot")
+                try:
+                    await asyncio.wait_for(self._slot_released.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            
+            if account.auth_manager is None:
+                initialized = await self._initialize_account_once(account.id)
+                if not initialized:
+                    self._release_slot(account.id)
+                    if len(self._accounts) == 1:
                         return None
-                
-                # Check TTL and refresh if needed
-                if account.models_cached_at > 0:
-                    age = time.time() - account.models_cached_at
-                    if age > ACCOUNT_CACHE_TTL:
-                        try:
-                            await self._refresh_account_models(account_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to refresh models for {account_id}: {e}")
-                # # Validate model availability
-                # if account.model_resolver:
-                #     normalized_model = normalize_model_name(model)
-                #     available_models = account.model_resolver.get_available_models()
-                #     if normalized_model not in available_models:
-                #         return None
-                
-                # Always return single account (ignore cooldown/failures)
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
-                return account
-            
-            # Multi-account logic: GLOBAL sticky
-            normalized_model = normalize_model_name(model)
-            
-            # ALWAYS iterate over ALL accounts
-            all_account_ids = list(self._accounts.keys())
-            
-            if self._selection == "round_robin":
-                # Each new request starts from the next account; failover calls reuse the cursor
-                start_index = self._rr_cursor % len(all_account_ids)
-                if not exclude_accounts:
-                    self._rr_cursor = (start_index + 1) % len(all_account_ids)
-            else:
-                # Start from GLOBAL index (one current account for ALL models)
-                start_index = self._current_account_index
-            
-            for i in range(len(all_account_ids)):
-                current_index = (start_index + i) % len(all_account_ids)
-                account_id = all_account_ids[current_index]
-                account = self._accounts[account_id]
-                
-                # Skip accounts already tried in current failover loop
-                if exclude_accounts and account_id in exclude_accounts:
-                    continue
-                
-                # Skip accounts in rate-limit (429) cooldown
-                if account.cooldown_until > time.time():
-                    continue
-                
-                # Check Circuit Breaker (Half-Open state with exponential backoff)
-                if account.failures > 0:
-                    time_since_failure = time.time() - account.last_failure_time
-                    
-                    # Exponential backoff: base * 2^(failures - 1), capped at MAX_MULTIPLIER
-                    # 1 failure: 60s, 2: 120s, 3: 240s, ..., 12+: 86400s (1 day cap)
-                    backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
-                    effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
-                    
-                    if time_since_failure < effective_timeout:
-                        # Probabilistic retry (10% chance)
-                        if random.random() > ACCOUNT_PROBABILISTIC_RETRY_CHANCE:
-                            continue
-                        else:
-                            logger.info(f"Probabilistic retry for broken account {account_id}")
-                    else:
-                        # Half-Open: recovery timeout passed
-                        logger.info(f"Half-Open state for {account_id} (recovery timeout passed, effective={effective_timeout}s)")
-                
-                # Lazy initialization
-                if account.auth_manager is None:
-                    success = await self._initialize_account(account_id)
-                    if not success:
+                    async with self._lock:
                         account.failures += 1
+                        account.last_failure_time = time.time()
                         self._dirty = True
-                        continue
-                
-                # Check TTL and refresh if needed
-                if account.models_cached_at > 0:
-                    age = time.time() - account.models_cached_at
-                    if age > ACCOUNT_CACHE_TTL:
-                        try:
-                            await self._refresh_account_models(account_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to refresh models for {account_id}: {e}")
-                # # Check if model is available on this account
-                # available_models = account.model_resolver.get_available_models()
-                # if normalized_model not in available_models:
-                #     continue
-                
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
-                # Account is suitable!
-                return account
+                    excluded.add(account.id)
+                    continue
             
-            # All accounts unavailable
-            return None
+            # Check TTL and refresh if needed
+            if account.models_cached_at > 0:
+                age = time.time() - account.models_cached_at
+                if age > ACCOUNT_CACHE_TTL:
+                    try:
+                        await self._refresh_account_models(account.id)
+                    except Exception as e:
+                        logger.warning(f"Failed to refresh models for {account.id}: {e}")
+            
+            # No model validation - let Kiro API decide (gateway, not gatekeeper)
+            return account
+    
+    def _select_account(self, excluded: set, advance_cursor: bool) -> Tuple[Optional[Account], bool]:
+        """
+        Picks the next eligible account. Pure in-memory; caller holds the lock.
+        
+        Args:
+            excluded: Account IDs not to pick
+            advance_cursor: Whether to move the round_robin cursor
+        
+        Returns:
+            Tuple of (account or None, whether some otherwise eligible account
+            was skipped only because it is at the concurrency cap)
+        """
+        # Special case: single account - bypass Circuit Breaker
+        # Circuit Breaker is meaningless for single account - user should see real Kiro API errors
+        # instead of generic "Account unavailable" after cooldown kicks in
+        if len(self._accounts) == 1:
+            account_id = list(self._accounts.keys())[0]
+            account = self._accounts[account_id]
+            if account_id in excluded:
+                return None, False
+            if self._at_capacity(account):
+                return None, True
+            return account, False
+        
+        # Multi-account logic
+        all_account_ids = list(self._accounts.keys())
+        
+        if self._selection == "round_robin":
+            # Each new request starts from the next account; failover calls reuse the cursor
+            start_index = self._rr_cursor % len(all_account_ids)
+            if advance_cursor:
+                self._rr_cursor = (start_index + 1) % len(all_account_ids)
+        else:
+            # Start from GLOBAL index (one current account for ALL models)
+            start_index = self._current_account_index
+        
+        saturated = False
+        for i in range(len(all_account_ids)):
+            current_index = (start_index + i) % len(all_account_ids)
+            account_id = all_account_ids[current_index]
+            account = self._accounts[account_id]
+            
+            # Skip accounts already tried in current failover loop
+            if account_id in excluded:
+                continue
+            
+            # Skip accounts in rate-limit (429) cooldown
+            if account.cooldown_until > time.time():
+                continue
+            
+            # Check Circuit Breaker (Half-Open state with exponential backoff)
+            if account.failures > 0:
+                time_since_failure = time.time() - account.last_failure_time
+                
+                # Exponential backoff: base * 2^(failures - 1), capped at MAX_MULTIPLIER
+                # 1 failure: 60s, 2: 120s, 3: 240s, ..., 12+: 86400s (1 day cap)
+                backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
+                effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
+                
+                if time_since_failure < effective_timeout:
+                    # Probabilistic retry (10% chance)
+                    if random.random() > ACCOUNT_PROBABILISTIC_RETRY_CHANCE:
+                        continue
+                    else:
+                        logger.info(f"Probabilistic retry for broken account {account_id}")
+                else:
+                    # Half-Open: recovery timeout passed
+                    logger.info(f"Half-Open state for {account_id} (recovery timeout passed, effective={effective_timeout}s)")
+            
+            if self._at_capacity(account):
+                saturated = True
+                continue
+            
+            # Account is suitable!
+            return account, False
+        
+        # All accounts unavailable
+        return None, saturated
+    
+    def _at_capacity(self, account: Account) -> bool:
+        """
+        Checks the per-account concurrency cap.
+        
+        Args:
+            account: Account to check
+        
+        Returns:
+            True if the cap is enabled and the account has no free slot
+        """
+        return self._max_concurrency > 0 and account.in_flight >= self._max_concurrency
+    
+    def _release_slot(self, account_id: str) -> None:
+        """
+        Returns one concurrency slot and wakes up queued requests.
+        
+        Synchronous on purpose so it can run from finalizers.
+        
+        Args:
+            account_id: Account whose slot is released
+        """
+        account = self._accounts.get(account_id)
+        if account is not None and account.in_flight > 0:
+            account.in_flight -= 1
+        self._slot_released.set()
+    
+    def all_accounts_busy(self) -> bool:
+        """
+        Checks whether every account is at its concurrency cap.
+        
+        Returns:
+            True if the cap is enabled and no account has a free slot
+        """
+        if self._max_concurrency <= 0 or not self._accounts:
+            return False
+        return all(self._at_capacity(account) for account in self._accounts.values())
+    
+    def busy_message(self) -> str:
+        """
+        User-facing explanation for "all accounts busy".
+        
+        Returns:
+            Actionable error message
+        """
+        return (
+            f"All {len(self._accounts)} Kiro account(s) are busy "
+            f"(ACCOUNT_MAX_CONCURRENCY={self._max_concurrency} concurrent requests each) and no slot "
+            f"freed up within {self._queue_timeout:.0f}s. Retry later, add accounts, or raise "
+            f"ACCOUNT_MAX_CONCURRENCY / ACCOUNT_QUEUE_TIMEOUT."
+        )
+    
+    def lease(self, account_id: str) -> AccountLease:
+        """
+        Wraps the slot reserved by ``get_next_account`` in a lease.
+        
+        Args:
+            account_id: Account returned by ``get_next_account``
+        
+        Returns:
+            Lease that must be released when the request is done
+        """
+        return AccountLease(self, account_id)
+    
+    async def _initialize_account_once(self, account_id: str) -> bool:
+        """
+        Initializes an account, coalescing concurrent attempts.
+        
+        Runs outside the global lock; a per-account lock makes sure only one
+        request performs the (network-bound) initialization while others for
+        the same account wait for its result.
+        
+        Args:
+            account_id: Account to initialize
+        
+        Returns:
+            True if the account is initialized
+        """
+        init_lock = self._init_locks.setdefault(account_id, asyncio.Lock())
+        async with init_lock:
+            account = self._accounts.get(account_id)
+            if account is None:
+                return False
+            if account.auth_manager is not None:
+                return True
+            return await self._initialize_account(account_id)
     
     async def report_success(self, account_id: str, model: str) -> None:
         """

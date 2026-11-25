@@ -25,6 +25,7 @@ Handles:
 - 429: exponential backoff
 - 5xx: exponential backoff
 - Timeouts: exponential backoff
+- HTTP 200 with empty body or in-stream exception (opt-in stream validation)
 
 Supports both per-request clients and shared application-level client
 with connection pooling for better resource management.
@@ -38,10 +39,18 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    MAX_RETRIES,
+    BASE_RETRY_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    FIRST_TOKEN_TIMEOUT,
+    STREAMING_READ_TIMEOUT,
+    STREAM_VALIDATION_ENABLED,
+)
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+from kiro.stream_validation import ProbeOutcome, build_failure_response, probe_kiro_stream
 
 
 class KiroHttpClient:
@@ -189,7 +198,8 @@ class KiroHttpClient:
         json_data: Optional[dict] = None,
         params: Optional[dict] = None,
         stream: bool = False,
-        retry_on_429: bool = True
+        retry_on_429: bool = True,
+        validate_stream: bool = False
     ) -> httpx.Response:
         """
         Executes an HTTP request with retry logic.
@@ -211,6 +221,12 @@ class KiroHttpClient:
             stream: Use streaming (default False)
             retry_on_429: Retry 429 on this account (default True); when False,
                 the 429 response is returned at once so the caller can fail over
+            validate_stream: For streaming generateAssistantResponse calls, read
+                the 200 body until it yields content (see kiro.stream_validation).
+                Empty bodies and in-stream exceptions are retried like 5xx/429 and
+                finally returned as synthetic error responses, so they reach the
+                normal failover/error handling instead of the client as an empty
+                "success". The returned 200 response replays the probed bytes.
         
         Returns:
             httpx.Response with successful response
@@ -227,6 +243,8 @@ class KiroHttpClient:
         last_error = None
         last_error_info: Optional[NetworkErrorInfo] = None
         last_response: Optional[httpx.Response] = None  # Для сохранения последнего 429/5xx
+        first_token_timeouts = 0
+        validate_stream = validate_stream and STREAM_VALIDATION_ENABLED
         
         for attempt in range(max_retries):
             try:
@@ -255,7 +273,48 @@ class KiroHttpClient:
                 
                 # Check status
                 if response.status_code == 200:
-                    return response
+                    if not (validate_stream and stream):
+                        return response
+                    
+                    try:
+                        probe = await probe_kiro_stream(response, FIRST_TOKEN_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        first_token_timeouts += 1
+                        logger.warning(
+                            f"[FirstTokenTimeout] Model did not respond within {FIRST_TOKEN_TIMEOUT}s "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        continue
+                    
+                    if probe.outcome == ProbeOutcome.OK and probe.response is not None:
+                        return probe.response  # type: ignore[return-value]
+                    
+                    failure = probe.failure
+                    assert failure is not None
+                    synthetic = build_failure_response(failure, response.request)
+                    
+                    if not failure.is_retryable:
+                        logger.warning(
+                            f"Kiro stream failed ({failure.reason}): {failure.message[:200]} - not retrying"
+                        )
+                        return synthetic
+                    
+                    # With failover enabled another account is the better retry target
+                    if not retry_on_429:
+                        logger.warning(
+                            f"Kiro stream failed ({failure.reason}), handing over to account failover"
+                        )
+                        return synthetic
+                    
+                    last_response = synthetic
+                    if attempt < max_retries - 1:
+                        delay = BASE_RETRY_DELAY * (2 ** attempt)
+                        logger.warning(
+                            f"Kiro stream failed ({failure.reason}), retrying in {delay}s "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(delay)
+                    continue
                 
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
@@ -344,6 +403,15 @@ class KiroHttpClient:
                 f"returning response to caller for classification"
             )
             return last_response
+        
+        if first_token_timeouts and last_error_info is None:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"Model did not respond within {FIRST_TOKEN_TIMEOUT}s after {max_retries} attempts. "
+                    "Please try again, or raise FIRST_TOKEN_TIMEOUT for very large requests."
+                )
+            )
         
         # All attempts exhausted - provide detailed, user-friendly error message
         if last_error_info:

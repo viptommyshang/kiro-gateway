@@ -1357,3 +1357,182 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+# ==================================================================================================
+# Binary AWS event stream framing (exception frames, mode detection)
+# ==================================================================================================
+
+from kiro.aws_eventstream import encode_frame  # noqa: E402
+
+
+def _frame(payload: str, event_type: str = "assistantResponseEvent") -> bytes:
+    return encode_frame({":message-type": "event", ":event-type": event_type}, payload.encode("utf-8"))
+
+
+def _exception(exception_type: str, payload: str) -> bytes:
+    return encode_frame(
+        {":message-type": "exception", ":exception-type": exception_type},
+        payload.encode("utf-8"),
+    )
+
+
+class TestAwsEventStreamParserBinaryFrames:
+    """Binary frames: headers are decoded, so in-stream exceptions become visible."""
+
+    def test_content_frames_produce_content_events(self):
+        """
+        What it does: Feeds two framed content events.
+        Purpose: Binary mode yields the same events as the text scanner.
+        """
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"content":"Hello"}') + _frame('{"content":" world"}'))
+        assert events == [{"type": "content", "data": "Hello"}, {"type": "content", "data": " world"}]
+        assert parser._mode == "binary"
+
+    def test_throttling_exception_becomes_error_event(self):
+        """
+        What it does: Feeds an exception frame inside the stream.
+        Purpose: This used to be silently dropped, producing an empty 200 answer.
+        """
+        parser = AwsEventStreamParser()
+        events = parser.feed(_exception("ThrottlingException", '{"message":"Too many requests"}'))
+        assert events == [{
+            "type": "error",
+            "data": {"exception_type": "ThrottlingException", "message": "Too many requests", "reason": None},
+        }]
+
+    def test_exception_with_reason_and_capitalized_message(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_exception(
+            "ValidationException",
+            '{"Message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}',
+        ))
+        assert events[0]["data"] == {
+            "exception_type": "ValidationException",
+            "message": "Input is too long.",
+            "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        }
+
+    def test_exception_with_non_json_payload(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_exception("InternalServerException", "upstream exploded"))
+        assert events[0]["data"]["message"] == "upstream exploded"
+
+    def test_exception_with_empty_payload(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_exception("ServiceUnavailableException", ""))
+        assert events[0]["data"]["message"] == "(no message)"
+
+    def test_error_frame_uses_error_message_header(self):
+        parser = AwsEventStreamParser()
+        frame = encode_frame(
+            {":message-type": "error", ":error-code": "InternalFailure", ":error-message": "boom"}, b""
+        )
+        events = parser.feed(frame)
+        assert events[0]["data"]["exception_type"] == "InternalFailure"
+        assert events[0]["data"]["message"] == "boom"
+
+    def test_error_frame_without_code_uses_message_type(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(encode_frame({":message-type": "error"}, b'{"message":"x"}'))
+        assert events[0]["data"]["exception_type"] == "error"
+
+    def test_invalid_state_event_becomes_error_event(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"reason":"INVALID_STATE","message":"bad state"}', "invalidStateEvent"))
+        assert events[0]["type"] == "error"
+        assert events[0]["data"]["reason"] == "INVALID_STATE"
+
+    def test_content_then_exception_keeps_order(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"content":"partial"}') + _exception("InternalServerException", '{"message":"m"}'))
+        assert [e["type"] for e in events] == ["content", "error"]
+
+    def test_unknown_event_types_are_ignored(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"conversationId":"abc"}', "messageMetadataEvent"))
+        assert events == []
+
+    def test_tool_use_frames(self):
+        """
+        What it does: Feeds a tool call split over three frames.
+        Purpose: Tool calls work unchanged in binary mode.
+        """
+        parser = AwsEventStreamParser()
+        parser.feed(_frame('{"name":"get_weather","toolUseId":"t1","input":""}', "toolUseEvent"))
+        parser.feed(_frame('{"input":"{\\"city\\":"}', "toolUseEvent"))
+        parser.feed(_frame('{"input":"\\"Paris\\"}"}', "toolUseEvent"))
+        parser.feed(_frame('{"stop":true}', "toolUseEvent"))
+        calls = parser.get_tool_calls()
+        assert calls[0]["function"]["name"] == "get_weather"
+        assert calls[0]["function"]["arguments"] == '{"city": "Paris"}'
+
+    def test_frames_split_at_every_byte(self):
+        """
+        What it does: Splits content + exception frames at every offset.
+        Purpose: Mode detection and decoding survive arbitrary chunking.
+        """
+        data = _frame('{"content":"Hi"}') + _exception("ThrottlingException", '{"message":"slow down"}')
+        for split in range(1, len(data)):
+            parser = AwsEventStreamParser()
+            events = parser.feed(data[:split]) + parser.feed(data[split:])
+            assert [e["type"] for e in events] == ["content", "error"], split
+
+    def test_deduplication_still_applies(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(_frame('{"content":"same"}') + _frame('{"content":"same"}'))
+        assert len(events) == 1
+
+    def test_lost_framing_falls_back_to_text(self):
+        """
+        What it does: Sends a valid frame, then raw JSON text.
+        Purpose: A framing surprise degrades to the legacy scanner instead of losing data.
+        """
+        parser = AwsEventStreamParser()
+        first = parser.feed(_frame('{"content":"a"}'))
+        second = parser.feed(b'{"content":"b"}')
+        assert first == [{"type": "content", "data": "a"}]
+        assert second == [{"type": "content", "data": "b"}]
+        assert parser._mode == "text"
+
+    def test_followup_frame_is_silent(self):
+        parser = AwsEventStreamParser()
+        assert parser.feed(_frame('{"followupPrompt":{"content":"x"}}', "followupPromptEvent")) == []
+
+
+class TestAwsEventStreamParserModeDetection:
+    """The parser picks binary or text mode from the first bytes."""
+
+    def test_text_stream_uses_text_mode(self):
+        parser = AwsEventStreamParser()
+        assert parser.feed(b'{"content":"Hi"}') == [{"type": "content", "data": "Hi"}]
+        assert parser._mode == "text"
+
+    def test_short_text_chunk_is_not_delayed(self):
+        """
+        What it does: Feeds a text chunk shorter than a prelude.
+        Purpose: Non-zero first byte decides text mode immediately.
+        """
+        parser = AwsEventStreamParser()
+        parser.feed(b'{"con')
+        assert parser._mode == "text"
+        assert parser.feed(b'tent":"x"}') == [{"type": "content", "data": "x"}]
+
+    def test_leading_zero_bytes_wait_for_prelude(self):
+        parser = AwsEventStreamParser()
+        frame = _frame('{"content":"x"}')
+        assert parser.feed(frame[:5]) == []
+        assert parser._mode is None
+        assert parser.feed(frame[5:]) == [{"type": "content", "data": "x"}]
+
+    def test_zero_prefixed_garbage_falls_back_to_text(self):
+        parser = AwsEventStreamParser()
+        events = parser.feed(b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00{"content":"x"}')
+        assert parser._mode == "text"
+        assert events == [{"type": "content", "data": "x"}]
+
+    def test_empty_chunk_is_ignored(self):
+        parser = AwsEventStreamParser()
+        assert parser.feed(b"") == []
+        assert parser._mode is None

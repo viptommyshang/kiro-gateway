@@ -38,6 +38,7 @@ import httpx
 from loguru import logger
 
 from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.stream_validation import KiroStreamError
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -76,6 +77,8 @@ class KiroEvent:
         context_usage_percentage: Context usage percentage (for context_usage events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
+        error: Error details for error events
+            (``exception_type``, ``message``, ``reason``)
     """
     type: str
     content: Optional[str] = None
@@ -85,6 +88,7 @@ class KiroEvent:
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
+    error: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -171,6 +175,7 @@ async def parse_kiro_stream(
             debug_logger.log_raw_chunk(first_byte_chunk)
         
         async for event in _process_chunk(parser, first_byte_chunk, thinking_parser):
+            _raise_on_error_event(event)
             if event.type == "content" or event.type == "thinking":
                 first_token_received = True
             yield event
@@ -181,6 +186,7 @@ async def parse_kiro_stream(
                 debug_logger.log_raw_chunk(chunk)
             
             async for event in _process_chunk(parser, chunk, thinking_parser):
+                _raise_on_error_event(event)
                 yield event
         
         # Finalize thinking parser and yield any remaining content
@@ -215,7 +221,7 @@ async def parse_kiro_stream(
         for tc in all_tool_calls:
             yield KiroEvent(type="tool_use", tool_use=tc)
             
-    except FirstTokenTimeoutError:
+    except (FirstTokenTimeoutError, KiroStreamError):
         raise
     except GeneratorExit:
         logger.debug("Client disconnected (GeneratorExit)")
@@ -280,6 +286,32 @@ async def _process_chunk(
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+        
+        elif event["type"] == "error":
+            yield KiroEvent(type="error", error=event["data"])
+
+
+def _raise_on_error_event(event: KiroEvent) -> None:
+    """
+    Turns an in-stream Kiro exception into a KiroStreamError.
+    
+    Errors before any output are normally caught earlier by stream validation
+    (and retried/failed over). One that arrives after content has started can
+    no longer be retried, so it must end the stream visibly instead of being
+    silently dropped (which used to look like a normal, truncated answer).
+    
+    Args:
+        event: Event from _process_chunk
+    
+    Raises:
+        KiroStreamError: If the event is an error event
+    """
+    if event.type == "error" and event.error is not None:
+        raise KiroStreamError(
+            event.error.get("exception_type") or "UnknownError",
+            event.error.get("message") or "(no message)",
+            event.error.get("reason"),
+        )
 
 
 # ==================================================================================================
