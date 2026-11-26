@@ -376,7 +376,11 @@ async def messages(
                             }
                         )
                     # Multiple accounts - generic error with context
-                    detail = "No available accounts for this model."
+                    detail = (
+                        account_manager.pool_empty_message()
+                        if account_manager.all_accounts_out_of_pool()
+                        else "No available accounts for this model."
+                    )
                     if last_error_message:
                         detail += f" Error from last account: {last_error_message}"
                     return JSONResponse(

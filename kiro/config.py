@@ -605,6 +605,18 @@ FAKE_REASONING_REFUSAL_TTL: int = max(1, int(os.getenv("FAKE_REASONING_REFUSAL_T
 # when every account is busy, instead of hammering a saturated account.
 ACCOUNT_MAX_CONCURRENCY: int = max(0, int(os.getenv("ACCOUNT_MAX_CONCURRENCY", "0")))
 
+# Account pool: accounts that cannot serve requests are taken OUT of rotation
+# (no probabilistic retries) until the time below has passed, then return
+# automatically. If they still fail, they are taken out again on the first error.
+# Reset the whole pool at any time with POST /admin/accounts/reset
+# (scripts/kiro-accounts.sh reset).
+#
+# Quota exhausted (HTTP 402, e.g. MONTHLY_REQUEST_COUNT). Default: 6 hours.
+ACCOUNT_QUOTA_EXHAUSTED_TTL: int = max(60, int(os.getenv("ACCOUNT_QUOTA_EXHAUSTED_TTL", "21600")))
+
+# Credentials invalid (initialization failed or HTTP 403 after token refresh). Default: 1 hour.
+ACCOUNT_INVALID_TTL: int = max(60, int(os.getenv("ACCOUNT_INVALID_TTL", "3600")))
+
 # Seconds a request waits for a free account slot when all accounts are at
 # ACCOUNT_MAX_CONCURRENCY before failing with 503. Ignored when the cap is 0.
 ACCOUNT_QUEUE_TIMEOUT: float = max(0.0, float(os.getenv("ACCOUNT_QUEUE_TIMEOUT", "60")))

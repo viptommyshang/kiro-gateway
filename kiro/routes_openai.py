@@ -327,7 +327,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             headers={"Retry-After": str(retry_after)}
                         )
                     # Multiple accounts - generic error with context
-                    detail = "No available accounts for this model."
+                    detail = (
+                        account_manager.pool_empty_message()
+                        if account_manager.all_accounts_out_of_pool()
+                        else "No available accounts for this model."
+                    )
                     if last_error_message:
                         detail += f" Error from last account: {last_error_message}"
                     raise HTTPException(status_code=503, detail=detail)

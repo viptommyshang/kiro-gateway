@@ -27,6 +27,7 @@ STARTUP_LOG_PATTERN='Scanning folder|Loaded [0-9]+ account|Initialized account|S
 DRY_RUN=0
 FORCE=0
 MOVE=0
+ALL=0
 
 usage() {
 	cat <<EOF
@@ -41,12 +42,19 @@ usage() {
                                （原因默认 disabled，例如 revoked、noquota），然后重启
   enable <名字>                把退役文件移回 accounts/，然后重启
   restart                      备份并删除 state.json，重启容器，等待健康，打印账号加载日志
+  pool                         查看账号池：每个账号的状态（可用/冷却/无额度/凭证失效）、何时自动回池、进行中请求数
+  reset                        一键重置账号池：所有已登录账号恢复为可用（清空无额度/失效标记、失败计数、限流冷却），
+                               不重启、不丢统计；网关没在运行时改为 restart
+  reset --all                  同上，并先把 disable 退役的账号文件全部移回 accounts/（会重启）
+  login [名字]                 用本机 kiro-cli 设备码登录一个新账号并直接加入池子
+                               （自动备份/恢复本机原来的 kiro-cli 登录；可连续执行，一次一个账号）
   status                       不重启，只看健康状态、账号加载日志和容器的 ACCOUNT_* 环境变量
 
 选项:
   --dry-run                    只打印将要执行的操作，不做任何修改
   --force                      允许停用最后一个账号
   --move                       只用于 add：移动而不是复制 data.sqlite3，避免留下第二份凭证
+  --all                        只用于 reset：同时恢复所有退役账号文件
   -h, --help                   显示本帮助
 
 名字可写成 c、acct-c 或 acct-c.sqlite3。
@@ -422,6 +430,134 @@ cmd_enable() {
 	cmd_restart
 }
 
+# 在容器内调用网关的账号池管理接口（PROXY_API_KEY 取容器自己的环境变量，不经过宿主机）
+admin_api() {
+	local method="$1" path="$2"
+	container_python "$method" "$path" <<'PY'
+import json, os, sys
+import httpx
+method, path = sys.argv[1], sys.argv[2]
+r = httpx.request(method, f"http://localhost:8000{path}",
+                  headers={"Authorization": f"Bearer {os.environ['PROXY_API_KEY']}"}, timeout=15)
+if r.status_code != 200:
+    print(f"HTTP {r.status_code}: {r.text[:300]}", file=sys.stderr)
+    sys.exit(1)
+data = r.json()
+labels = {"active": "可用", "degraded": "可用(近期失败)", "not_initialized": "可用(未初始化)",
+          "cooldown": "限流冷却", "exhausted": "无额度(已剔除)", "invalid": "凭证失效(已剔除)"}
+if "reset" in data:
+    s = data["reset"]
+    print(f"  已重置 {s['accounts']} 个账号：无额度 {s['exhausted']}，凭证失效 {s['invalid']}，"
+          f"熔断 {s['broken']}，限流冷却 {s['cooldown']}")
+rows = data.get("accounts", [])
+if "active" in data:
+    print(f"  池内可用 {data['active']}/{data['total']}")
+for a in rows:
+    back = f"  {a['returns_in_seconds']}s 后自动回池" if a["returns_in_seconds"] else ""
+    reason = f"（{a['reason']}）" if a["reason"] else ""
+    print(f"  {a['id']:24} {labels.get(a['state'], a['state'])}{reason}{back}  "
+          f"进行中={a['in_flight']} 总={a['total_requests']} 成功={a['successful_requests']} 失败={a['failed_requests']}")
+PY
+}
+
+gateway_running() {
+	docker exec "$CONTAINER" true >/dev/null 2>&1
+}
+
+cmd_pool() {
+	gateway_running || die "容器 $CONTAINER 未运行"
+	info "账号池状态"
+	admin_api GET /admin/accounts
+}
+
+cmd_reset() {
+	if [ "$ALL" -eq 1 ]; then
+		require_accounts_dir
+		local f name dst restored=0
+		info "恢复所有退役账号文件到 ${ACCOUNTS_DIR}"
+		while IFS= read -r f; do
+			[ -n "$f" ] || continue
+			name="${f##*/}"
+			dst="$ACCOUNTS_DIR/${name%%.sqlite3.*}.sqlite3"
+			if [ -e "$dst" ]; then
+				echo "  跳过 ${name}：$dst 已存在"
+				continue
+			fi
+			refuse_duplicate "$f"
+			run mv "$f" "$dst"
+			restored=$((restored + 1))
+		done <<<"$(retired_files)"
+		echo "  恢复了 $restored 个账号文件"
+		# 新文件只有重启才会被加载；restart 会同时清空 state.json
+		cmd_restart
+		return
+	fi
+	if gateway_running; then
+		info "一键重置账号池（不重启）"
+		if [ "$DRY_RUN" -eq 1 ]; then
+			echo "  + POST /admin/accounts/reset"
+			return
+		fi
+		if admin_api POST /admin/accounts/reset; then
+			return
+		fi
+		echo "  网关不支持 /admin/accounts/reset（旧版本？），改为 restart" >&2
+	else
+		echo "  容器未运行，改为 restart" >&2
+	fi
+	cmd_restart
+}
+
+cmd_login() {
+	command -v kiro-cli >/dev/null 2>&1 || die "本机没有 kiro-cli（安装见 Linux部署.md 第 1 节）"
+	local cli_dir="$HOME/.local/share/kiro-cli"
+	local cli_db="$cli_dir/data.sqlite3"
+	! pgrep -x kiro-cli >/dev/null 2>&1 || die "有 kiro-cli 进程在运行，先退出它"
+	LOGIN_TMP="$(mktemp -d)"
+	chmod 700 "$LOGIN_TMP"
+	LOGIN_CLI_DIR="$cli_dir"
+	LOGIN_HAS_BACKUP=0
+	trap restore_cli_login EXIT
+	cat <<EOF
+==> 即将用设备码登录新账号
+  ⚠ 用浏览器【无痕窗口】打开下面打印的 URL，否则会直接用浏览器里已登录的旧账号批准。
+  本机原来的 kiro-cli 登录会先移开（不执行 logout，避免注销服务端会话），结束后自动移回。
+EOF
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "  + mv $cli_db* $LOGIN_TMP/  &&  kiro-cli login --use-device-flow  &&  add --move"
+		return
+	fi
+	if ls "$cli_db"* >/dev/null 2>&1; then
+		mv "$cli_db"* "$LOGIN_TMP/"
+		LOGIN_HAS_BACKUP=1
+	fi
+	kiro-cli login --use-device-flow
+	local who
+	who="$(kiro-cli whoami 2>&1 | grep -i '^Email' || true)"
+	[ -n "$who" ] || die "登录未完成（kiro-cli whoami 没有 Email）"
+	info "新账号 $who"
+	# 拷出一份完整的 sqlite（合并 WAL，避免拷到半截文件），再删掉本机这份，只保留池子里一份
+	python3 - "$cli_db" "$LOGIN_TMP/new.sqlite3" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2])
+src.backup(dst); dst.close(); src.close()
+PY
+	rm -f "$cli_db"*
+	MOVE=1
+	cmd_add "$LOGIN_TMP/new.sqlite3" "$@"
+}
+
+# login 结束（成功或失败）时把本机原来的 kiro-cli 登录移回，删除临时文件
+restore_cli_login() {
+	if [ "${LOGIN_HAS_BACKUP:-0}" -eq 1 ]; then
+		rm -f "$LOGIN_CLI_DIR/data.sqlite3"*
+		mv "$LOGIN_TMP"/data.sqlite3* "$LOGIN_CLI_DIR/" 2>/dev/null || true
+		echo "  已恢复本机原来的 kiro-cli 登录"
+	fi
+	[ -z "${LOGIN_TMP:-}" ] || rm -rf "$LOGIN_TMP"
+}
+
+
 main() {
 	local args=()
 	while [ $# -gt 0 ]; do
@@ -429,6 +565,7 @@ main() {
 			--dry-run) DRY_RUN=1 ;;
 			--force) FORCE=1 ;;
 			--move) MOVE=1 ;;
+			--all) ALL=1 ;;
 			-h | --help)
 				usage
 				exit 0
@@ -444,6 +581,7 @@ main() {
 	local cmd="${args[0]}"
 	args=("${args[@]:1}")
 	[ "$MOVE" -eq 0 ] || [ "$cmd" = "add" ] || die "--move 只能用于 add"
+	[ "$ALL" -eq 0 ] || [ "$cmd" = "reset" ] || die "--all 只能用于 reset"
 	[ "$DRY_RUN" -eq 0 ] || echo "*** dry-run：只打印操作，不做修改 ***"
 	case "$cmd" in
 		list) cmd_list ;;
@@ -452,6 +590,9 @@ main() {
 		enable) cmd_enable ${args[@]+"${args[@]}"} ;;
 		restart) cmd_restart ;;
 		status) cmd_status ;;
+		pool) cmd_pool ;;
+		reset) cmd_reset ;;
+		login) cmd_login ${args[@]+"${args[@]}"} ;;
 		*)
 			usage
 			die "未知命令: $cmd"

@@ -61,6 +61,8 @@ from kiro.config import (
     ACCOUNT_RATE_LIMIT_COOLDOWN,
     ACCOUNT_MAX_CONCURRENCY,
     ACCOUNT_QUEUE_TIMEOUT,
+    ACCOUNT_QUOTA_EXHAUSTED_TTL,
+    ACCOUNT_INVALID_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
 )
@@ -128,6 +130,19 @@ def _format_duration(seconds: float) -> str:
         return f"{int(seconds / 86400)}d"
 
 
+POOL_ACTIVE = "active"
+"""Account is in rotation."""
+
+POOL_EXHAUSTED = "exhausted"
+"""Account ran out of quota (HTTP 402); out of rotation until pool_until."""
+
+POOL_INVALID = "invalid"
+"""Account credentials do not work; out of rotation until pool_until."""
+
+QUOTA_REASONS = frozenset({"MONTHLY_REQUEST_COUNT", "QUOTA_EXCEEDED", "INSUFFICIENT_QUOTA", "OVERAGE_REQUEST_LIMIT"})
+"""Kiro error reasons that mean the account has no quota left."""
+
+
 @dataclass
 class AccountStats:
     """
@@ -158,6 +173,9 @@ class Account:
         models_cached_at: Timestamp of last model cache update
         cooldown_until: Rate-limit (429) cooldown end timestamp (round_robin, not persisted)
         in_flight: Requests currently holding a slot on this account (not persisted)
+        pool_state: POOL_ACTIVE, POOL_EXHAUSTED or POOL_INVALID (persisted)
+        pool_reason: Why the account left the pool (persisted)
+        pool_until: Epoch seconds when a removed account returns to the pool (persisted)
         stats: Usage statistics
     """
     id: str
@@ -169,6 +187,9 @@ class Account:
     models_cached_at: float = 0.0
     cooldown_until: float = 0.0
     in_flight: int = 0
+    pool_state: str = POOL_ACTIVE
+    pool_reason: str = ""
+    pool_until: float = 0.0
     stats: AccountStats = field(default_factory=AccountStats)
 
 
@@ -443,6 +464,9 @@ class AccountManager:
                     account.failures = data.get("failures", 0)
                     account.last_failure_time = data.get("last_failure_time", 0.0)
                     account.models_cached_at = data.get("models_cached_at", 0.0)
+                    account.pool_state = data.get("pool_state", POOL_ACTIVE)
+                    account.pool_reason = data.get("pool_reason", "")
+                    account.pool_until = data.get("pool_until", 0.0)
                     
                     stats_data = data.get("stats", {})
                     account.stats = AccountStats(
@@ -469,6 +493,9 @@ class AccountManager:
                     "failures": account.failures,
                     "last_failure_time": account.last_failure_time,
                     "models_cached_at": account.models_cached_at,
+                    "pool_state": account.pool_state,
+                    "pool_reason": account.pool_reason,
+                    "pool_until": account.pool_until,
                     "stats": {
                         "total_requests": account.stats.total_requests,
                         "successful_requests": account.stats.successful_requests,
@@ -799,6 +826,7 @@ class AccountManager:
                     async with self._lock:
                         account.failures += 1
                         account.last_failure_time = time.time()
+                        self._remove_from_pool(account, POOL_INVALID, "initialization failed", ACCOUNT_INVALID_TTL)
                         self._dirty = True
                     excluded.add(account.id)
                     continue
@@ -865,6 +893,10 @@ class AccountManager:
             if account.cooldown_until > time.time():
                 continue
             
+            # Skip accounts removed from the pool (no quota / broken credentials)
+            if not self._is_in_pool(account):
+                continue
+            
             # Check Circuit Breaker (Half-Open state with exponential backoff)
             if account.failures > 0:
                 time_since_failure = time.time() - account.last_failure_time
@@ -920,6 +952,132 @@ class AccountManager:
             account.in_flight -= 1
         self._slot_released.set()
     
+    def _is_in_pool(self, account: Account) -> bool:
+        """
+        Checks pool membership, returning expired removals to the pool.
+        
+        Caller holds the lock.
+        
+        Args:
+            account: Account to check
+        
+        Returns:
+            True if the account may receive requests
+        """
+        if account.pool_state == POOL_ACTIVE:
+            return True
+        if account.pool_until and account.pool_until <= time.time():
+            logger.info(
+                f"Account {account.id} returns to pool (was {account.pool_state}: {account.pool_reason}); "
+                f"it will be removed again if it still fails"
+            )
+            self._restore_to_pool(account)
+            return True
+        return False
+    
+    def _remove_from_pool(self, account: Account, state: str, reason: str, ttl: int) -> None:
+        """
+        Takes an account out of rotation for ``ttl`` seconds. Caller holds the lock.
+        
+        Args:
+            account: Account to remove
+            state: POOL_EXHAUSTED or POOL_INVALID
+            reason: Human-readable reason (Kiro reason code)
+            ttl: Seconds until it is automatically returned
+        """
+        already = account.pool_state == state
+        account.pool_state = state
+        account.pool_reason = reason
+        account.pool_until = time.time() + ttl
+        active = sum(1 for a in self._accounts.values() if a.pool_state == POOL_ACTIVE)
+        if not already:
+            logger.warning(
+                f"Account {account.id} removed from pool: {state} ({reason}); "
+                f"returns in {_format_duration(ttl)}. Active accounts left: {active}/{len(self._accounts)}"
+            )
+    
+    def _restore_to_pool(self, account: Account) -> None:
+        """
+        Puts an account back into rotation. Caller holds the lock.
+        
+        Args:
+            account: Account to restore
+        """
+        account.pool_state = POOL_ACTIVE
+        account.pool_reason = ""
+        account.pool_until = 0.0
+        self._dirty = True
+    
+    async def reset_pool(self) -> Dict[str, int]:
+        """
+        Returns every account to the pool and clears failure state.
+        
+        Clears quota/invalid removals, circuit-breaker failures and 429
+        cooldowns. Usage statistics are kept. Persists immediately.
+        
+        Returns:
+            Counts: total accounts and how many were reset from each state
+        """
+        async with self._lock:
+            summary = {"accounts": len(self._accounts), "exhausted": 0, "invalid": 0, "broken": 0, "cooldown": 0}
+            now = time.time()
+            for account in self._accounts.values():
+                if account.pool_state == POOL_EXHAUSTED:
+                    summary["exhausted"] += 1
+                elif account.pool_state == POOL_INVALID:
+                    summary["invalid"] += 1
+                if account.failures > 0:
+                    summary["broken"] += 1
+                if account.cooldown_until > now:
+                    summary["cooldown"] += 1
+                self._restore_to_pool(account)
+                account.failures = 0
+                account.last_failure_time = 0.0
+                account.cooldown_until = 0.0
+            self._dirty = True
+        await self._save_state()
+        logger.info(f"Account pool reset: {summary}")
+        return summary
+    
+    def pool_status(self) -> List[Dict[str, object]]:
+        """
+        Describes every account for monitoring (no secrets).
+        
+        Returns:
+            One dict per account: id, state, reason, seconds until return,
+            in-flight requests, failures and request statistics
+        """
+        now = time.time()
+        rows: List[Dict[str, object]] = []
+        for account in self._accounts.values():
+            if account.pool_state != POOL_ACTIVE and not (account.pool_until and account.pool_until <= now):
+                state = account.pool_state
+            elif account.cooldown_until > now:
+                state = "cooldown"
+            elif account.failures > 0:
+                state = "degraded"
+            elif account.auth_manager is None:
+                state = "not_initialized"
+            else:
+                state = POOL_ACTIVE
+            returns_in = 0
+            if state in (POOL_EXHAUSTED, POOL_INVALID):
+                returns_in = max(0, int(account.pool_until - now))
+            elif state == "cooldown":
+                returns_in = max(0, int(account.cooldown_until - now))
+            rows.append({
+                "id": Path(account.id).name if os.sep in account.id else account.id,
+                "state": state,
+                "reason": account.pool_reason,
+                "returns_in_seconds": returns_in,
+                "in_flight": account.in_flight,
+                "failures": account.failures,
+                "total_requests": account.stats.total_requests,
+                "successful_requests": account.stats.successful_requests,
+                "failed_requests": account.stats.failed_requests,
+            })
+        return rows
+    
     def all_accounts_busy(self) -> bool:
         """
         Checks whether every account is at its concurrency cap.
@@ -930,6 +1088,33 @@ class AccountManager:
         if self._max_concurrency <= 0 or not self._accounts:
             return False
         return all(self._at_capacity(account) for account in self._accounts.values())
+    
+    def all_accounts_out_of_pool(self) -> bool:
+        """
+        Checks whether every account is currently removed from the pool.
+        
+        Returns:
+            True if there is at least one account and none is in the pool
+        """
+        now = time.time()
+        return bool(self._accounts) and all(
+            a.pool_state != POOL_ACTIVE and a.pool_until > now for a in self._accounts.values()
+        )
+    
+    def pool_empty_message(self) -> str:
+        """
+        User-facing explanation when no account is left in the pool.
+        
+        Returns:
+            Actionable error message
+        """
+        reasons = sorted({f"{a.pool_state}: {a.pool_reason}" for a in self._accounts.values()})
+        soonest = min(a.pool_until for a in self._accounts.values()) - time.time()
+        return (
+            f"No Kiro account is available: all {len(self._accounts)} account(s) were removed from the pool "
+            f"({'; '.join(reasons)}). The first returns in {_format_duration(max(0, soonest))}. "
+            f"Add accounts or reset the pool (scripts/kiro-accounts.sh reset / POST /admin/accounts/reset)."
+        )
     
     def busy_message(self) -> str:
         """
@@ -997,6 +1182,9 @@ class AccountManager:
             if account.failures > 0:
                 account.failures = 0
                 self._dirty = True
+            if account.pool_state != POOL_ACTIVE:
+                logger.info(f"Account {account_id} is serving requests again, back in pool")
+                self._restore_to_pool(account)
             
             # Update stats
             account.stats.total_requests += 1
@@ -1060,6 +1248,22 @@ class AccountManager:
                     f"Model '{model}' not available on account {account_id}: "
                     f"status={status_code}, reason={reason}"
                 )
+                return
+            
+            # No quota left: take the account out of the pool instead of probing it
+            if status_code == 402 or (reason or "").upper() in QUOTA_REASONS:
+                account.stats.total_requests += 1
+                account.stats.failed_requests += 1
+                self._remove_from_pool(account, POOL_EXHAUSTED, reason or f"HTTP {status_code}", ACCOUNT_QUOTA_EXHAUSTED_TTL)
+                self._dirty = True
+                return
+            
+            # Token still rejected after a forced refresh: credentials are broken
+            if status_code == 403:
+                account.stats.total_requests += 1
+                account.stats.failed_requests += 1
+                self._remove_from_pool(account, POOL_INVALID, reason or "HTTP 403", ACCOUNT_INVALID_TTL)
+                self._dirty = True
                 return
             
             # round_robin with several accounts: 429 gets a short fixed cooldown, not the breaker

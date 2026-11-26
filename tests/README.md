@@ -74,6 +74,7 @@ tests/
 ├── unit/                            # Unit tests for individual components
 │   ├── test_account_errors.py      # Account System error classification (FATAL vs RECOVERABLE)
 │   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence, concurrency slots/cap)
+│   ├── test_account_pool.py        # Account pool: quota/invalid removal, TTL return, reset, status, /admin/accounts
 │   ├── test_account_round_robin.py # round_robin selection, 429 cooldown/failover, all-accounts-busy 503
 │   ├── test_aws_eventstream.py     # AWS event stream binary frame decoder (prelude/CRC, headers, chunk splits)
 │   ├── test_auth_manager.py        # KiroAuthManager tests (including api_region parameter priority)
