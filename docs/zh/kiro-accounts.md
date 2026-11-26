@@ -61,6 +61,31 @@ bash scripts/kiro-accounts.sh restart                    # 停容器 → 备份�
 `restart` 会把 `state/state.json` 备份成 `state.json.bak` 再删除，失败计数和统计从零开始。
 它只是 `docker stop/start`，**不会重新读取 `.env`**。名字可写 `c`、`acct-c` 或 `acct-c.sqlite3`。
 
+### 账号池（自动剔除 + 一键重置）
+
+`accounts/` 里的所有账号组成账号池，请求按 `round_robin` 在**池内**账号之间轮流分配。网关会自动维护池子：
+
+| 情况 | 处理 | 何时回池 |
+|---|---|---|
+| 402 / `MONTHLY_REQUEST_COUNT` 等额度用完 | 立即剔除，不再分请求（也不做试探） | `ACCOUNT_QUOTA_EXHAUSTED_TTL` 秒后（默认 6 小时）自动回池试一次，仍无额度再剔除 |
+| 403（刷新 token 后仍被拒）/ 初始化失败 | 标记凭证失效并剔除 | `ACCOUNT_INVALID_TTL` 秒后（默认 1 小时） |
+| 429 限流 | 短暂冷却 `ACCOUNT_RATE_LIMIT_COOLDOWN` 秒，不剔除 | 冷却结束 |
+| 被剔除的账号又成功了 | 立即回池 | — |
+
+剔除状态写进 `state.json`，网关重启后仍然生效。池子空了时，接口返回 503，说明每个账号的原因、最早回池时间，以及重置方法。
+
+```bash
+bash scripts/kiro-accounts.sh pool          # 看池子：每个账号 可用 / 限流冷却 / 无额度(已剔除) / 凭证失效(已剔除)、多久后回池
+bash scripts/kiro-accounts.sh reset         # 一键重置：所有已登录账号恢复为可用（不重启、不丢统计）
+bash scripts/kiro-accounts.sh reset --all   # 同上，并把 disable 退役的账号文件全部移回 accounts/（会重启）
+bash scripts/kiro-accounts.sh login d       # 本机 kiro-cli 设备码登录一个新账号并直接加入池子，可连续执行
+```
+
+`reset` 适合月初额度刷新后、或手工确认账号恢复后使用。也可以直接调接口：
+`GET /admin/accounts`、`POST /admin/accounts/reset`（`Authorization: Bearer <PROXY_API_KEY>`，不返回任何凭证）。
+
+`login` 会先把本机原有的 kiro-cli 登录文件移开（不执行 logout），登录完成后把新凭证移进 `accounts/`，再把原来的登录移回。设备码 URL 要用浏览器**无痕窗口**打开。
+
 ### 典型场景
 
 加账号：

@@ -31,6 +31,8 @@ requests that will fail on all accounts.
 from enum import Enum
 from typing import Optional
 
+from kiro.stream_validation import RETRYABLE_STREAM_REASONS
+
 
 class ErrorType(Enum):
     """
@@ -57,7 +59,9 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
     - 400 + INVALID_MODEL_ID: Could be invalid model or insufficient subscription
     - 402: Payment required (monthly quota exceeded, billing issues)
     - 403: Token expired/invalid
-    - 429: Rate limit exceeded
+    - 429: Rate limit exceeded (including in-stream throttling, reason THROTTLED)
+    - 502 + EMPTY_RESPONSE / UPSTREAM_STREAM_ERROR: HTTP 200 stream that was
+      empty or failed mid-generation (synthesized by stream validation)
     
     FATAL errors (return to client immediately):
     - 400 + CONTENT_LENGTH_EXCEEDS_THRESHOLD: Context overflow
@@ -123,6 +127,12 @@ def classify_error(status_code: int, reason: Optional[str]) -> ErrorType:
     # FATAL: Validation error (malformed request)
     if status_code == 422:
         return ErrorType.FATAL
+    
+    # RECOVERABLE: Kiro answered HTTP 200 but the stream was empty or carried an
+    # in-stream server exception (see kiro.stream_validation). These are
+    # per-request/per-account hiccups, so another account is worth a try.
+    if status_code == 502 and reason in RETRYABLE_STREAM_REASONS:
+        return ErrorType.RECOVERABLE
     
     # FATAL: Server errors (5xx)
     # Note: 503 could be temporary, but we classify as FATAL for simplicity

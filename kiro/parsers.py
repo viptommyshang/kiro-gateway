@@ -29,11 +29,22 @@ Contains classes and functions for:
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from kiro.aws_eventstream import (
+    PRELUDE_LENGTH,
+    EventStreamDecoder,
+    EventStreamFormatError,
+    EventStreamFrame,
+    looks_like_frame_prelude,
+)
 from kiro.utils import generate_tool_call_id
+
+
+REFUSAL_EXCEPTION_TYPE = "ContentRefusal"
+"""Synthetic exception type for refusals reported in a ``metadataEvent``."""
 
 
 def find_matching_brace(text: str, start_pos: int) -> int:
@@ -222,6 +233,8 @@ class AwsEventStreamParser:
     - tool_stop: End of tool call
     - usage: Credit consumption information
     - context_usage: Context usage percentage
+    - error: In-stream exception or refusal (binary frames only), e.g. ThrottlingException
+    - reasoning: Native model reasoning text (reasoningContentEvent, binary frames only)
     
     Attributes:
         buffer: Buffer for accumulating data
@@ -248,16 +261,33 @@ class AwsEventStreamParser:
         ('{"contextUsagePercentage":', 'context_usage'),
     ]
     
+    # Event types (``:event-type`` header) that signal a failed generation even
+    # though they arrive as regular events rather than exception frames.
+    ERROR_EVENT_TYPES = frozenset({"invalidStateEvent"})
+    
     def __init__(self):
         """Initializes the parser."""
         self.buffer = ""
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
+        # Framing mode is detected from the first bytes: "binary" decodes AWS
+        # event stream frames (headers included), "text" keeps the legacy
+        # pattern scanner for anything that is not framed.
+        self._mode: Optional[str] = None
+        self._pending = bytearray()
+        self._decoder = EventStreamDecoder()
+        # Set by the streaming layer once native reasoning has been emitted
+        self.native_reasoning_started = False
     
     def feed(self, chunk: bytes) -> List[Dict[str, Any]]:
         """
         Adds chunk to buffer and returns parsed events.
+        
+        Besides payload events, binary frames with ``:message-type`` of
+        ``exception``/``error`` (and error-like events such as
+        ``invalidStateEvent``) are returned as ``{"type": "error", ...}``
+        events, so callers can tell a failed generation from an empty one.
         
         Args:
             chunk: Bytes of data from stream
@@ -265,11 +295,264 @@ class AwsEventStreamParser:
         Returns:
             List of events in {"type": str, "data": Any} format
         """
-        try:
-            self.buffer += chunk.decode('utf-8', errors='ignore')
-        except Exception:
+        if not chunk:
             return []
         
+        if self._mode is None:
+            self._pending.extend(chunk)
+            # Event stream frames start with a big-endian length < 16 MiB, so the
+            # first byte is always 0x00. Anything else is plain text.
+            if self._pending[0] != 0:
+                self._mode = "text"
+            elif len(self._pending) < PRELUDE_LENGTH:
+                return []
+            else:
+                self._mode = "binary" if looks_like_frame_prelude(self._pending) else "text"
+            chunk = bytes(self._pending)
+            self._pending.clear()
+            logger.debug(f"AWS event stream parser mode: {self._mode}")
+        
+        if self._mode == "binary":
+            return self._feed_binary(chunk)
+        return self._feed_text(chunk)
+    
+    def _feed_text(self, chunk: bytes) -> List[Dict[str, Any]]:
+        """
+        Legacy path: scans decoded text for known JSON payload prefixes.
+        
+        Args:
+            chunk: Bytes of data from stream
+        
+        Returns:
+            Parsed events
+        """
+        self.buffer += chunk.decode('utf-8', errors='ignore')
+        events, self.buffer = self._extract_payload_events(self.buffer)
+        return events
+    
+    def _feed_binary(self, chunk: bytes) -> List[Dict[str, Any]]:
+        """
+        Decodes AWS event stream frames and dispatches them by message type.
+        
+        Falls back to the text scanner (for the rest of the stream) if the
+        bytes stop looking like frames, so a framing surprise degrades to the
+        legacy behavior instead of losing data.
+        
+        Args:
+            chunk: Bytes of data from stream
+        
+        Returns:
+            Parsed events
+        """
+        try:
+            frames = self._decoder.feed(chunk)
+        except EventStreamFormatError as e:
+            logger.warning(f"AWS event stream framing lost ({e}), falling back to text scanning")
+            self._mode = "text"
+            return self._feed_text(self._decoder.take_pending())
+        
+        events: List[Dict[str, Any]] = []
+        for frame in frames:
+            events.extend(self._process_frame(frame))
+        return events
+    
+    def _process_frame(self, frame: EventStreamFrame) -> List[Dict[str, Any]]:
+        """
+        Converts one decoded frame into parser events.
+        
+        Args:
+            frame: Decoded event stream frame
+        
+        Returns:
+            Parsed events (possibly empty)
+        """
+        message_type = frame.message_type
+        payload_text = frame.payload_text
+        
+        if message_type in ("exception", "error"):
+            error_event = self._build_error_event(
+                frame.exception_type or message_type,
+                payload_text,
+                frame.headers.get(":error-message"),
+            )
+            logger.warning(
+                f"Kiro API stream {message_type}: "
+                f"type={error_event['data']['exception_type']}, "
+                f"message={error_event['data']['message'][:200]}"
+            )
+            return [error_event]
+        
+        event_type = frame.event_type
+        if event_type == "metadataEvent":
+            refusal_event = self._process_metadata_frame(payload_text)
+            return [refusal_event] if refusal_event else []
+        if event_type == "reasoningContentEvent":
+            reasoning_event = self._process_reasoning_frame(payload_text)
+            return [reasoning_event] if reasoning_event else []
+        if event_type in self.ERROR_EVENT_TYPES:
+            error_event = self._build_error_event(event_type, payload_text, None)
+            logger.warning(
+                f"Kiro API stream reported {event_type}: "
+                f"reason={error_event['data']['reason']}, message={error_event['data']['message'][:200]}"
+            )
+            return [error_event]
+        
+        events, leftover = self._extract_payload_events(payload_text)
+        if not events and payload_text.strip() and not self._is_known_silent_payload(payload_text):
+            logger.debug(f"Ignoring Kiro event '{event_type}': {payload_text[:200]}")
+        elif leftover.strip():
+            logger.debug(f"Unparsed remainder in Kiro event '{event_type}': {leftover[:200]}")
+        return events
+    
+    @staticmethod
+    def _load_json_object(payload_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Parses a frame payload that is expected to be a JSON object.
+        
+        Args:
+            payload_text: Frame payload as text
+        
+        Returns:
+            Parsed dict, or None if the payload is empty, invalid or not an object
+        """
+        if not payload_text.strip():
+            return None
+        try:
+            data = json.loads(payload_text)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse Kiro frame payload: {payload_text[:100]}")
+            return None
+        return data if isinstance(data, dict) else None
+    
+    def _process_metadata_frame(self, payload_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Inspects a ``metadataEvent`` for a model refusal.
+        
+        Kiro reports refusals (e.g. ``REASONING_EXTRACTION``) only here, as
+        ``stopReason: CONTENT_FILTERED`` plus ``stopDetails.refusal`` inside an
+        HTTP 200 stream that carries no content. Without this check the
+        client gets an empty "successful" answer.
+        
+        Args:
+            payload_text: Frame payload as text
+        
+        Returns:
+            ``error`` event for refusals, otherwise None
+        """
+        data = self._load_json_object(payload_text)
+        if data is None:
+            return None
+        stop_details = data.get("stopDetails")
+        refusal = stop_details.get("refusal") if isinstance(stop_details, dict) else None
+        if not isinstance(refusal, dict) and data.get("stopReason") != "CONTENT_FILTERED":
+            return None
+        
+        refusal = refusal if isinstance(refusal, dict) else {}
+        category = refusal.get("category")
+        explanation = refusal.get("explanation")
+        event = {
+            "type": "error",
+            "data": {
+                "exception_type": REFUSAL_EXCEPTION_TYPE,
+                "message": explanation if isinstance(explanation, str) and explanation else "The model refused to answer",
+                "reason": category if isinstance(category, str) and category else str(data.get("stopReason") or "CONTENT_FILTERED"),
+            },
+        }
+        logger.warning(
+            f"Kiro API stream refusal: category={event['data']['reason']}, "
+            f"message={event['data']['message'][:200]}"
+        )
+        return event
+    
+    def _process_reasoning_frame(self, payload_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Converts a native ``reasoningContentEvent`` into a ``reasoning`` event.
+        
+        Kiro streams the model's own reasoning as ``{"text": "..."}`` frames,
+        followed by a ``{"signature": "..."}`` frame that carries no text.
+        
+        Args:
+            payload_text: Frame payload as text
+        
+        Returns:
+            ``reasoning`` event, or None for signature/empty frames
+        """
+        data = self._load_json_object(payload_text)
+        if data is None:
+            return None
+        text = data.get("text")
+        if not isinstance(text, str) or not text:
+            return None
+        return {"type": "reasoning", "data": text}
+    
+    def _is_known_silent_payload(self, payload_text: str) -> bool:
+        """
+        Checks whether a payload matched a known pattern that yields no event.
+        
+        followupPrompt events, for instance, are recognised but intentionally
+        produce nothing; they should not be reported as "ignored".
+        
+        Args:
+            payload_text: Frame payload as text
+        
+        Returns:
+            True if the payload starts with a known event pattern
+        """
+        stripped = payload_text.lstrip()
+        return any(stripped.startswith(pattern) for pattern, _ in self.EVENT_PATTERNS)
+    
+    @staticmethod
+    def _build_error_event(
+        exception_type: str,
+        payload_text: str,
+        header_message: Optional[Any],
+    ) -> Dict[str, Any]:
+        """
+        Builds a normalized error event from an exception frame.
+        
+        Args:
+            exception_type: Exception/event type name (e.g. ThrottlingException)
+            payload_text: Frame payload, usually ``{"message": "...", "reason": ...}``
+            header_message: Optional ``:error-message`` header value
+        
+        Returns:
+            Event dict ``{"type": "error", "data": {...}}``
+        """
+        message = ""
+        reason: Optional[str] = None
+        try:
+            payload = json.loads(payload_text) if payload_text.strip() else {}
+        except json.JSONDecodeError:
+            payload = {}
+            message = payload_text.strip()
+        if isinstance(payload, dict):
+            raw_message = payload.get("message") or payload.get("Message")
+            if isinstance(raw_message, str):
+                message = raw_message
+            raw_reason = payload.get("reason")
+            if isinstance(raw_reason, str):
+                reason = raw_reason
+        if not message and isinstance(header_message, str):
+            message = header_message
+        return {
+            "type": "error",
+            "data": {
+                "exception_type": exception_type,
+                "message": message or "(no message)",
+                "reason": reason,
+            },
+        }
+    
+    def _extract_payload_events(self, text: str) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Extracts every complete known JSON event from ``text``.
+        
+        Args:
+            text: Text buffer to scan
+        
+        Returns:
+            Tuple of (events, unconsumed remainder of ``text``)
+        """
         events = []
         
         while True:
@@ -278,7 +561,7 @@ class AwsEventStreamParser:
             earliest_type = None
             
             for pattern, event_type in self.EVENT_PATTERNS:
-                pos = self.buffer.find(pattern)
+                pos = text.find(pattern)
                 if pos != -1 and (earliest_pos == -1 or pos < earliest_pos):
                     earliest_pos = pos
                     earliest_type = event_type
@@ -287,13 +570,13 @@ class AwsEventStreamParser:
                 break
             
             # Find JSON end
-            json_end = find_matching_brace(self.buffer, earliest_pos)
+            json_end = find_matching_brace(text, earliest_pos)
             if json_end == -1:
                 # JSON not complete, wait for more data
                 break
             
-            json_str = self.buffer[earliest_pos:json_end + 1]
-            self.buffer = self.buffer[json_end + 1:]
+            json_str = text[earliest_pos:json_end + 1]
+            text = text[json_end + 1:]
             
             try:
                 data = json.loads(json_str)
@@ -303,7 +586,7 @@ class AwsEventStreamParser:
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON: {json_str[:100]}")
         
-        return events
+        return events, text
     
     def _process_event(self, data: dict, event_type: str) -> Optional[Dict[str, Any]]:
         """

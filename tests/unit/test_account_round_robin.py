@@ -382,10 +382,18 @@ class TestRoundRobinRoutes:
 
 def _upstream_response(status_code: int, body: bytes = b""):
     """httpx-like streamed response for KiroHttpClient."""
+    if status_code == 200 and not body:
+        # A 200 must carry content, otherwise stream validation treats it as empty
+        body = b'{"content":"ok"}'
     response = MagicMock()
     response.status_code = status_code
     response.aread = AsyncMock(return_value=body)
     response.aclose = AsyncMock()
+
+    async def aiter_bytes():
+        yield body
+
+    response.aiter_bytes = aiter_bytes
     return response
 
 
@@ -456,3 +464,51 @@ class TestSingleAccountRoundRobinEndToEnd:
 
         assert statuses == [200, 200, 200]
         assert account.stats.successful_requests == 3
+
+
+class TestAllAccountsBusyRoutes:
+    """ACCOUNT_MAX_CONCURRENCY reached on every account: 503 + Retry-After, both APIs."""
+
+    def _busy_manager(self, tmp_path):
+        manager = _make_manager(tmp_path, 2, "round_robin")
+        manager._max_concurrency = 1
+        manager._queue_timeout = 0.01
+        for account in manager._accounts.values():
+            account.in_flight = 1
+        return manager
+
+    def test_openai_returns_503_with_retry_after(self, account_app, tmp_path, valid_proxy_api_key):
+        client, install = account_app
+        install(self._busy_manager(tmp_path))
+
+        response = _openai_post(client, valid_proxy_api_key)
+
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "5"
+        assert "ACCOUNT_MAX_CONCURRENCY" in response.text
+
+    def test_anthropic_returns_503_with_retry_after(self, account_app, tmp_path, valid_proxy_api_key):
+        client, install = account_app
+        install(self._busy_manager(tmp_path))
+
+        response = _anthropic_post(client, valid_proxy_api_key)
+
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "5"
+        assert response.json()["error"]["type"] == "overloaded_error"
+
+    def test_slots_are_returned_after_failed_requests(self, account_app, tmp_path, valid_proxy_api_key):
+        """
+        What it does: Both accounts answer 429.
+        Purpose: Failover paths release every slot they reserved.
+        """
+        client, install = account_app
+        manager = _make_manager(tmp_path, 2, "round_robin")
+        install(manager)
+        factory, _ = _mock_http_client_class([_rate_limited_response(), _rate_limited_response()])
+
+        with patch("kiro.routes_openai.KiroHttpClient", side_effect=factory):
+            response = _openai_post(client, valid_proxy_api_key)
+
+        assert response.status_code == 429
+        assert all(a.in_flight == 0 for a in manager._accounts.values())

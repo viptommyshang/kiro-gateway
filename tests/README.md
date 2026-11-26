@@ -73,7 +73,10 @@ tests/
 ├── conftest.py                      # Shared fixtures and utilities
 ├── unit/                            # Unit tests for individual components
 │   ├── test_account_errors.py      # Account System error classification (FATAL vs RECOVERABLE)
-│   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence)
+│   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence, concurrency slots/cap)
+│   ├── test_account_pool.py        # Account pool: quota/invalid removal, TTL return, reset, status, /admin/accounts
+│   ├── test_account_round_robin.py # round_robin selection, 429 cooldown/failover, all-accounts-busy 503
+│   ├── test_aws_eventstream.py     # AWS event stream binary frame decoder (prelude/CRC, headers, chunk splits)
 │   ├── test_auth_manager.py        # KiroAuthManager tests (including api_region parameter priority)
 │   ├── test_cache.py               # ModelInfoCache tests (is_valid_model, add_hidden_model)
 │   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, Account System constants)
@@ -83,6 +86,7 @@ tests/
 │   ├── test_debug_logger.py        # DebugLogger tests (off/errors/all modes)
 │   ├── test_debug_middleware.py    # DebugLoggerMiddleware tests (endpoint filtering, mode handling)
 │   ├── test_exceptions.py          # Exception handlers tests (validation_exception_handler, sanitize_validation_errors)
+│   ├── test_fake_reasoning_policy.py # Per-model fake-reasoning refusal registry and payload stripping
 │   ├── test_http_client.py         # KiroHttpClient tests (including params parameter for Account System)
 │   ├── test_kiro_errors.py         # Kiro API error enhancement tests (CONTENT_LENGTH_EXCEEDS_THRESHOLD, unknown errors)
 │   ├── test_main_cli.py            # CLI argument parsing tests (--host, --port)
@@ -92,9 +96,10 @@ tests/
 │   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming, server-side tools)
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
 │   ├── test_network_errors.py      # Network error handling tests
-│   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration)
+│   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration, binary frames/exceptions)
 │   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery, WebSearch, Account System failover)
 │   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery, WebSearch, Account System failover)
+│   ├── test_stream_validation.py   # HTTP 200 stream validation (empty/exception → retry/failover/error), all 4 API×mode combos
 │   ├── test_streaming_anthropic.py # Anthropic streaming response tests (truncation detection, stop_reason priority, initial_response reuse)
 │   ├── test_streaming_core.py      # Shared streaming logic tests (first-token retry, initial_response parameter)
 │   ├── test_streaming_openai.py    # OpenAI streaming response tests (truncation detection, finish_reason priority, initial_response reuse)

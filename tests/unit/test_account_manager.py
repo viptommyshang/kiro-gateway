@@ -1300,3 +1300,233 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+# ==================================================================================================
+# Concurrency: slots, leases, per-account cap, no network I/O under the global lock
+# ==================================================================================================
+
+from kiro.account_manager import AccountLease  # noqa: E402
+
+
+def _ready_manager(tmp_path, count: int, cap: int = 0, queue_timeout: float = 1.0) -> AccountManager:
+    """AccountManager with `count` initialized accounts and the given concurrency cap."""
+    manager = AccountManager(str(tmp_path / "credentials.json"), str(tmp_path / "state.json"))
+    manager._selection = "round_robin"
+    manager._max_concurrency = cap
+    manager._queue_timeout = queue_timeout
+    for i in range(count):
+        auth_manager = MagicMock()
+        auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
+        manager._accounts[f"acct-{i}"] = Account(
+            id=f"acct-{i}",
+            auth_manager=auth_manager,
+            model_cache=MagicMock(),
+            model_resolver=MagicMock(),
+            models_cached_at=time.time(),
+        )
+    return manager
+
+
+class TestAccountConcurrency:
+    @pytest.mark.asyncio
+    async def test_get_next_account_reserves_a_slot(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1)
+        account = await manager.get_next_account("m")
+        assert account.in_flight == 1
+        manager.lease(account.id).release()
+        assert account.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_lease_release_is_idempotent(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1)
+        account = await manager.get_next_account("m")
+        await manager.get_next_account("m")
+        lease = manager.lease(account.id)
+        lease.release()
+        lease.release()
+        assert account.in_flight == 1
+        assert lease.released
+
+    @pytest.mark.asyncio
+    async def test_lease_transfer_moves_ownership(self, tmp_path):
+        """
+        What it does: Hands a slot to a stream lease.
+        Purpose: The route's cleanup must not free a slot the stream still uses.
+        """
+        manager = _ready_manager(tmp_path, 1)
+        account = await manager.get_next_account("m")
+        lease = manager.lease(account.id)
+        stream_lease = lease.transfer()
+        lease.release()
+        assert account.in_flight == 1
+        stream_lease.release()
+        assert account.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_transfer_of_released_lease_holds_nothing(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1)
+        account = await manager.get_next_account("m")
+        lease = manager.lease(account.id)
+        lease.release()
+        successor = lease.transfer()
+        assert successor.released
+        successor.release()
+        assert account.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_garbage_collected_lease_releases_its_slot(self, tmp_path):
+        """
+        What it does: Drops a lease without releasing it.
+        Purpose: A never-iterated StreamingResponse cannot leak a slot.
+        """
+        manager = _ready_manager(tmp_path, 1)
+        account = await manager.get_next_account("m")
+        lease = AccountLease(manager, account.id)
+        del lease
+        assert account.in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_release_never_goes_negative(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1)
+        manager._release_slot("acct-0")
+        manager._release_slot("unknown")
+        assert manager._accounts["acct-0"].in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_unlimited_by_default(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1, cap=0)
+        accounts = [await manager.get_next_account("m") for _ in range(50)]
+        assert accounts[0].in_flight == 50
+        assert not manager.all_accounts_busy()
+
+    @pytest.mark.asyncio
+    async def test_cap_spreads_load_to_free_accounts(self, tmp_path):
+        """
+        What it does: Sticky mode with cap=1 and two accounts.
+        Purpose: A saturated account is skipped even when selection prefers it.
+        """
+        manager = _ready_manager(tmp_path, 2, cap=1)
+        manager._selection = "sticky"
+        first = await manager.get_next_account("m")
+        second = await manager.get_next_account("m")
+        assert {first.id, second.id} == {"acct-0", "acct-1"}
+        assert manager.all_accounts_busy()
+
+    @pytest.mark.asyncio
+    async def test_saturated_request_waits_for_a_free_slot(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1, cap=1, queue_timeout=5)
+        first = await manager.get_next_account("m")
+        waiter = asyncio.create_task(manager.get_next_account("m"))
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+
+        manager.lease(first.id).release()
+        second = await asyncio.wait_for(waiter, timeout=1)
+
+        assert second.id == first.id
+        assert second.in_flight == 1
+
+    @pytest.mark.asyncio
+    async def test_queue_timeout_returns_none(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1, cap=1, queue_timeout=0.05)
+        await manager.get_next_account("m")
+        started = time.monotonic()
+        assert await manager.get_next_account("m") is None
+        assert time.monotonic() - started >= 0.04
+        assert manager.all_accounts_busy()
+        assert "ACCOUNT_MAX_CONCURRENCY=1" in manager.busy_message()
+
+    @pytest.mark.asyncio
+    async def test_all_excluded_returns_immediately(self, tmp_path):
+        """
+        What it does: Every account was already tried in this request.
+        Purpose: Failover loops end immediately instead of queueing.
+        """
+        manager = _ready_manager(tmp_path, 2, cap=1, queue_timeout=5)
+        await manager.get_next_account("m")
+        started = time.monotonic()
+        assert await manager.get_next_account("m", exclude_accounts={"acct-0", "acct-1"}) is None
+        assert time.monotonic() - started < 1
+
+    @pytest.mark.asyncio
+    async def test_many_waiters_all_get_served(self, tmp_path):
+        manager = _ready_manager(tmp_path, 2, cap=2, queue_timeout=5)
+
+        async def worker():
+            account = await manager.get_next_account("m")
+            assert account is not None
+            assert account.in_flight <= 2
+            await asyncio.sleep(0.01)
+            manager.lease(account.id).release()
+
+        await asyncio.wait_for(asyncio.gather(*(worker() for _ in range(20))), timeout=5)
+        assert all(a.in_flight == 0 for a in manager._accounts.values())
+
+
+class TestAccountInitializationOutsideGlobalLock:
+    @pytest.mark.asyncio
+    async def test_slow_initialization_does_not_block_other_requests(self, tmp_path):
+        """
+        What it does: Account A needs a slow (network) initialization.
+        Purpose: Requests that can use account B are not stuck behind it.
+        """
+        manager = _ready_manager(tmp_path, 2)
+        manager._accounts["acct-0"].auth_manager = None
+        release_init = asyncio.Event()
+
+        async def slow_init(account_id):
+            await release_init.wait()
+            manager._accounts[account_id].auth_manager = MagicMock(api_host="https://runtime.x")
+            return True
+
+        manager._initialize_account = slow_init
+
+        slow = asyncio.create_task(manager.get_next_account("m"))  # starts at acct-0
+        await asyncio.sleep(0.01)
+        fast = await asyncio.wait_for(manager.get_next_account("m"), timeout=0.5)
+        assert fast.id == "acct-1"
+
+        release_init.set()
+        assert (await slow).id == "acct-0"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_initialization_is_coalesced(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1)
+        manager._accounts["acct-0"].auth_manager = None
+        calls = 0
+
+        async def init(account_id):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.02)
+            manager._accounts[account_id].auth_manager = MagicMock(api_host="https://runtime.x")
+            return True
+
+        manager._initialize_account = init
+        results = await asyncio.gather(*(manager.get_next_account("m") for _ in range(5)))
+        assert all(r is not None for r in results)
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_initialization_frees_slot_and_tries_next(self, tmp_path):
+        manager = _ready_manager(tmp_path, 2)
+        manager._accounts["acct-0"].auth_manager = None
+        manager._initialize_account = AsyncMock(return_value=False)
+
+        account = await manager.get_next_account("m")
+
+        assert account.id == "acct-1"
+        broken = manager._accounts["acct-0"]
+        assert broken.in_flight == 0
+        assert broken.failures == 1
+        assert broken.last_failure_time > 0
+
+    @pytest.mark.asyncio
+    async def test_failed_initialization_single_account_returns_none(self, tmp_path):
+        manager = _ready_manager(tmp_path, 1)
+        manager._accounts["acct-0"].auth_manager = None
+        manager._initialize_account = AsyncMock(return_value=False)
+
+        assert await manager.get_next_account("m") is None
+        assert manager._accounts["acct-0"].in_flight == 0

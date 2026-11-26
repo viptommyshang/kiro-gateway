@@ -48,7 +48,12 @@ from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
-from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
+from kiro.streaming_openai import (
+    stream_kiro_to_openai,
+    collect_stream_response,
+    stream_with_first_token_retry,
+    format_openai_stream_error,
+)
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
@@ -297,6 +302,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             )
             
             if account is None:
+                if account_manager.all_accounts_busy():
+                    detail = account_manager.busy_message()
+                    logger.warning(f"HTTP 503 - POST /v1/chat/completions - {detail[:100]}")
+                    raise HTTPException(status_code=503, detail=detail, headers={"Retry-After": "5"})
                 # All accounts unavailable
                 if len(all_accounts) == 1:
                     # Single account - return original error with original status code
@@ -318,13 +327,19 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             headers={"Retry-After": str(retry_after)}
                         )
                     # Multiple accounts - generic error with context
-                    detail = "No available accounts for this model."
+                    detail = (
+                        account_manager.pool_empty_message()
+                        if account_manager.all_accounts_out_of_pool()
+                        else "No available accounts for this model."
+                    )
                     if last_error_message:
                         detail += f" Error from last account: {last_error_message}"
                     raise HTTPException(status_code=503, detail=detail)
             
             # Mark account as tried in current failover loop
             tried_accounts.add(account.id)
+            # get_next_account reserved a concurrency slot; every exit path below returns it
+            lease = account_manager.lease(account.id)
             
             # Use objects from account
             auth_manager = account.auth_manager
@@ -345,12 +360,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     profile_arn_for_payload
                 )
             except ValueError as e:
+                lease.release()
                 raise HTTPException(status_code=400, detail=str(e))
             
             # Log Kiro payload
             try:
-                kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-                if debug_logger:
+                # Serializing large payloads is CPU-bound on the event loop; skip it unless needed
+                if debug_logger and debug_logger.enabled:
+                    kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
                     debug_logger.log_kiro_request_body(kiro_request_body)
             except Exception as e:
                 logger.warning(f"Failed to log Kiro request: {e}")
@@ -372,7 +389,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     url,
                     kiro_payload,
                     stream=True,
-                    retry_on_429=account_manager.retry_rate_limit_in_place()
+                    retry_on_429=account_manager.retry_rate_limit_in_place(),
+                    validate_stream=True
                 )
                 
                 if response.status_code == 200:
@@ -384,14 +402,16 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
                     
                     if request_data.stream:
-                        # Streaming mode
+                        # Streaming mode: the stream now owns the account slot
+                        stream_lease = lease.transfer()
+                        
                         async def stream_wrapper():
                             streaming_error = None
                             client_disconnected = False
                             try:
                                 async def make_retry_request():
                                     return await http_client.request_with_retry(
-                                        "POST", url, kiro_payload, stream=True
+                                        "POST", url, kiro_payload, stream=True, validate_stream=True
                                     )
                                 
                                 async for chunk in stream_with_first_token_retry(
@@ -410,12 +430,15 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                             except Exception as e:
                                 streaming_error = e
+                                # Error chunk + [DONE] end the stream cleanly; re-raising here would
+                                # abort the chunked response mid-flight (the error is logged below)
                                 try:
+                                    yield format_openai_stream_error(e)
                                     yield "data: [DONE]\n\n"
                                 except Exception:
                                     pass
-                                raise
                             finally:
+                                stream_lease.release()
                                 await http_client.close()
                                 if streaming_error:
                                     error_type = type(streaming_error).__name__
@@ -552,6 +575,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 if debug_logger:
                     debug_logger.flush_on_error(500, str(e))
                 raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+            finally:
+                # No-op when the slot was handed over to a stream
+                lease.release()
         
         # All attempts exhausted
         if len(all_accounts) == 1:
@@ -598,8 +624,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     
     # Log Kiro payload
     try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
+        # Serializing large payloads is CPU-bound on the event loop; skip it unless needed
+        if debug_logger and debug_logger.enabled:
+            kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
             debug_logger.log_kiro_request_body(kiro_request_body)
     except Exception as e:
         logger.warning(f"Failed to log Kiro request: {e}")
@@ -626,7 +653,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             "POST",
             url,
             kiro_payload,
-            stream=True
+            stream=True,
+            validate_stream=True
         )
         
         if response.status_code != 200:
@@ -686,7 +714,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     # Create retry request function for retries
                     async def make_retry_request():
                         return await http_client.request_with_retry(
-                            "POST", url, kiro_payload, stream=True
+                            "POST", url, kiro_payload, stream=True, validate_stream=True
                         )
                     
                     # Use retry wrapper with initial response
@@ -709,11 +737,13 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     streaming_error = e
                     # Try to send [DONE] to client before finishing
                     # so client doesn't "hang" waiting for data
+                    # Error chunk + [DONE] end the stream cleanly; re-raising here would
+                    # abort the chunked response mid-flight (the error is logged below)
                     try:
+                        yield format_openai_stream_error(e)
                         yield "data: [DONE]\n\n"
                     except Exception:
                         pass  # Client already disconnected
-                    raise
                 finally:
                     await http_client.close()
                     # Log access log for streaming (success or error)

@@ -79,6 +79,11 @@ class DebugLogger:
         """Checks if logging is enabled."""
         return DEBUG_MODE in ("errors", "all")
     
+    @property
+    def enabled(self) -> bool:
+        """True if any debug logging mode is active (callers can skip expensive prep)."""
+        return self._is_enabled()
+    
     def _is_immediate_write(self) -> bool:
         """Checks if immediate file writing is needed (all mode)."""
         return DEBUG_MODE == "all"
